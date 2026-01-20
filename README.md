@@ -24,7 +24,7 @@ A Python-based SSH security audit tool for testing login capabilities across mul
 
 ```bash
 # Clone the repository
-git clone https://github.com/security-tools/sshcheck.git
+git clone https://github.com/rom/sshcheck.git
 cd sshcheck
 
 # Install dependencies
@@ -249,8 +249,8 @@ Structured JSON with full scan details:
   "scan_info": {
     "program": "sshcheck",
     "version": "1.0.0",
-    "start_time": "2024-01-15T10:30:00",
-    "end_time": "2024-01-15T10:30:45",
+    "start_time": "2026-01-15T10:30:00",
+    "end_time": "2026-01-15T10:30:45",
     "duration_seconds": 45.32
   },
   "statistics": {
@@ -268,7 +268,7 @@ Structured JSON with full scan details:
       "username": "admin",
       "password": "password123",
       "success": true,
-      "timestamp": "2024-01-15T10:30:05",
+      "timestamp": "2026-01-15T10:30:05",
       "initial_output": "Welcome to Ubuntu 22.04 LTS\n...",
       "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3",
       "error_message": "",
@@ -284,8 +284,8 @@ Comma-separated values for spreadsheet import:
 
 ```csv
 host,port,username,password,success,timestamp,banner,initial_output,error_message,connection_time
-192.168.1.1,22,admin,password123,True,2024-01-15T10:30:05,SSH-2.0-OpenSSH_8.9,"Welcome to Ubuntu",,0.523
-192.168.1.2,22,root,toor,False,2024-01-15T10:30:10,,,Authentication failed,1.234
+192.168.1.1,22,admin,password123,True,2026-01-15T10:30:05,SSH-2.0-OpenSSH_8.9,"Welcome to Ubuntu",,0.523
+192.168.1.2,22,root,toor,False,2026-01-15T10:30:10,,,Authentication failed,1.234
 ```
 
 ## Exit Codes

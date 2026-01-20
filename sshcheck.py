@@ -5,7 +5,7 @@ sshcheck - SSH Security Audit Client
 A security audit tool for testing SSH login capabilities across multiple hosts.
 Designed for authorized penetration testing and security assessments.
 
-Author: Security Audit Tools
+Author: Robert Malmgren, with help of Claude code
 License: MIT
 """
 
@@ -645,7 +645,7 @@ Examples:
   %(prog)s -t server.example.com -u root -p secret --port 2222
       Scan non-standard SSH port
 
-Report bugs to: https://github.com/security-tools/sshcheck/issues
+Report bugs to: https://github.com/rom/sshcheck/issues
         """
     )
 

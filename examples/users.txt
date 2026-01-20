@@ -1,0 +1,18 @@
+# Example username file for sshcheck
+# Lines starting with # are comments and will be ignored
+
+# Common default usernames
+root
+admin
+administrator
+user
+test
+guest
+ubuntu
+ec2-user
+centos
+vagrant
+pi
+oracle
+mysql
+postgres

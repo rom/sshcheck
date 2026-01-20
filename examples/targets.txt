@@ -1,0 +1,18 @@
+# Example target file for sshcheck
+# Lines starting with # are comments and will be ignored
+# Empty lines are also ignored
+
+# Single IP addresses
+192.168.1.1
+192.168.1.2
+192.168.1.10
+
+# CIDR notation (scans all hosts in subnet)
+# 10.0.0.0/24
+
+# IP range notation (scans 192.168.2.1 through 192.168.2.50)
+# 192.168.2.1-50
+
+# Hostnames
+# server1.example.com
+# server2.example.com

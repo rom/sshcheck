@@ -1,0 +1,256 @@
+.\" Man page for sshcheck
+.\" Contact: security-tools@example.com
+.TH SSHCHECK 1 "January 2024" "sshcheck 1.0.0" "Security Audit Tools"
+.SH NAME
+sshcheck \- SSH Security Audit Client for testing login capabilities
+.SH SYNOPSIS
+.B sshcheck
+[\fB\-t\fR \fIHOST\fR | \fB\-T\fR \fIFILE\fR]
+[\fB\-u\fR \fIUSER\fR | \fB\-U\fR \fIFILE\fR]
+[\fB\-p\fR \fIPASS\fR | \fB\-P\fR \fIFILE\fR]
+[\fB\-\-port\fR \fIPORT\fR | \fB\-\-port-file\fR \fIFILE\fR]
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B sshcheck
+is a security audit tool designed for testing SSH login capabilities across multiple hosts.
+It attempts to authenticate to target SSH servers using provided credentials and captures
+initial server output including welcome messages, banners, and shell prompts.
+.PP
+This tool is intended for authorized penetration testing, security assessments, and
+network audits. Always ensure you have proper authorization before scanning any systems.
+.SH OPTIONS
+.SS "Target Specification"
+.TP
+.BR \-t ", " \-\-target " " \fIHOST\fR
+Target host(s) to scan. Can be specified multiple times. Accepts:
+.RS
+.IP \(bu 2
+Single IP address (e.g., 192.168.1.1)
+.IP \(bu 2
+CIDR range (e.g., 192.168.1.0/24)
+.IP \(bu 2
+IP range (e.g., 192.168.1.1-254)
+.IP \(bu 2
+Hostname (e.g., server.example.com)
+.RE
+.TP
+.BR \-T ", " \-\-target-file " " \fIFILE\fR
+File containing target hosts, one per line. Supports the same formats as \fB-t\fR.
+Lines starting with # are treated as comments.
+.SS "Username Specification"
+.TP
+.BR \-u ", " \-\-user " " \fIUSER\fR
+Username(s) to try. Can be specified multiple times for multiple usernames.
+.TP
+.BR \-U ", " \-\-user-file " " \fIFILE\fR
+File containing usernames, one per line. Lines starting with # are treated as comments.
+.SS "Password Specification"
+.TP
+.BR \-p ", " \-\-password " " \fIPASS\fR
+Password(s) to try. Can be specified multiple times for multiple passwords.
+.TP
+.BR \-P ", " \-\-password-file " " \fIFILE\fR
+File containing passwords, one per line. Lines starting with # are treated as comments.
+.SS "Port Specification"
+.TP
+.BR \-\-port " " \fIPORT\fR
+SSH port(s) to try. Default is 22. Can be specified multiple times.
+.TP
+.BR \-\-port-file " " \fIFILE\fR
+File containing ports, one per line. Lines starting with # are treated as comments.
+.SS "Output Options"
+.TP
+.BR \-o ", " \-\-output " " \fIFILE\fR
+Save results to the specified file. The output format is determined by the \fB-f\fR option.
+.TP
+.BR \-f ", " \-\-format " " \fIFORMAT\fR
+Output format for the results file. Valid options:
+.RS
+.IP \fBtext\fR
+Human-readable text format (default)
+.IP \fBjson\fR
+JSON format with full scan details and statistics
+.IP \fBcsv\fR
+Comma-separated values for spreadsheet import
+.RE
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output with detailed error messages and debug information.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress progress output, only show final summary.
+.SS "Performance Options"
+.TP
+.BR \-n ", " \-\-threads " " \fINUM\fR
+Number of concurrent threads. Default is 1 (sequential scanning).
+Higher values increase scan speed but may trigger rate limiting.
+Recommended range: 1-50.
+.TP
+.BR \-\-timeout " " \fISECONDS\fR
+Connection timeout in seconds. Default is 10 seconds.
+Increase for slow networks or decrease for faster scanning.
+.SS "Other Options"
+.TP
+.BR \-V ", " \-\-version
+Display version information and exit.
+.TP
+.BR \-h ", " \-\-help
+Display help message and exit.
+.SH INPUT FILE FORMATS
+.SS "Target File Format"
+The target file should contain one target per line. Supported formats:
+.PP
+.nf
+.RS
+# Comment line (ignored)
+192.168.1.1
+192.168.1.0/24
+10.0.0.1-254
+server.example.com
+.RE
+.fi
+.SS "Username File Format"
+The username file should contain one username per line:
+.PP
+.nf
+.RS
+# Common usernames
+root
+admin
+administrator
+user
+.RE
+.fi
+.SS "Password File Format"
+The password file should contain one password per line:
+.PP
+.nf
+.RS
+# Common passwords
+password
+admin
+123456
+password123
+.RE
+.fi
+.SS "Port File Format"
+The port file should contain one port number per line:
+.PP
+.nf
+.RS
+# Common SSH ports
+22
+2222
+22222
+.RE
+.fi
+.SH OUTPUT FILE FORMATS
+.SS "Text Format"
+Human-readable format containing scan statistics and detailed results
+for successful logins, including captured output.
+.SS "JSON Format"
+Structured JSON containing:
+.IP \(bu 2
+\fBscan_info\fR: Program version, timestamps, duration
+.IP \(bu 2
+\fBstatistics\fR: Attempt counts, success/failure rates
+.IP \(bu 2
+\fBresults\fR: Array of all scan results with full details
+.SS "CSV Format"
+Comma-separated values with headers:
+.PP
+host, port, username, password, success, timestamp, banner, initial_output, error_message, connection_time
+.SH EXIT STATUS
+.TP
+.B 0
+At least one successful login was found.
+.TP
+.B 1
+No successful logins found or error occurred.
+.TP
+.B 130
+Scan was interrupted by user (Ctrl+C).
+.SH EXAMPLES
+.TP
+Scan single host with single credentials:
+.B sshcheck -t 192.168.1.1 -u admin -p password123
+.TP
+Scan entire subnet:
+.B sshcheck -t 192.168.1.0/24 -u root -p admin123
+.TP
+Scan using credential lists and save JSON output:
+.B sshcheck -T targets.txt -U users.txt -P passwords.txt -o results.json -f json
+.TP
+Scan IP range with 10 threads and 5 second timeout:
+.B sshcheck -t 10.0.0.1-254 -u admin -p password -n 10 --timeout 5
+.TP
+Scan non-standard SSH port:
+.B sshcheck -t server.example.com -u root -p secret --port 2222
+.TP
+Scan multiple ports:
+.B sshcheck -t 192.168.1.1 -u root -p pass --port 22 --port 2222 --port 22222
+.TP
+Verbose scanning with multiple users and passwords:
+.B sshcheck -t 192.168.1.1 -u root -u admin -p pass1 -p pass2 -v
+.SH ERROR MESSAGES
+.TP
+.B "Authentication failed"
+The username/password combination was rejected by the server.
+.TP
+.B "Connection timed out"
+The host did not respond within the timeout period.
+Check if the host is reachable and SSH service is running.
+.TP
+.B "Connection refused"
+The target host actively refused the connection.
+SSH service may not be running on the specified port.
+.TP
+.B "No route to host"
+Network path to the target is unavailable.
+Check network configuration and routing.
+.TP
+.B "Network is unreachable"
+Cannot reach the target network.
+Verify network connectivity.
+.SH FILES
+.TP
+.I targets.txt
+Example target hosts file
+.TP
+.I users.txt
+Example usernames file
+.TP
+.I passwords.txt
+Example passwords file
+.TP
+.I results.json
+Default JSON output file
+.SH SECURITY CONSIDERATIONS
+.PP
+This tool is designed for authorized security testing only.
+Unauthorized use against systems you do not own or have explicit
+permission to test may violate computer crime laws.
+.PP
+Always ensure you have written authorization before performing
+security assessments.
+.PP
+Passwords provided on the command line may be visible in process
+listings. Use password files (\fB-P\fR) for sensitive credentials.
+.SH REQUIREMENTS
+.IP \(bu 2
+Python 3.6 or later
+.IP \(bu 2
+paramiko library (pip install paramiko)
+.SH BUGS
+Report bugs at: https://github.com/security-tools/sshcheck/issues
+.SH AUTHOR
+Security Audit Tools <security-tools@example.com>
+.SH SEE ALSO
+.BR ssh (1),
+.BR ssh-keygen (1),
+.BR nmap (1)
+.SH COPYRIGHT
+Copyright (C) 2024 Security Audit Tools.
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE.

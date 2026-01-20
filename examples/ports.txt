@@ -1,0 +1,11 @@
+# Example port file for sshcheck
+# Lines starting with # are comments and will be ignored
+
+# Standard SSH port
+22
+
+# Common alternative SSH ports
+2222
+22222
+8022
+10022

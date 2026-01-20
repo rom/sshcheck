@@ -39,7 +39,7 @@ class TestScanResult(unittest.TestCase):
             username="admin",
             password="secret",
             success=True,
-            timestamp="2024-01-01T12:00:00"
+            timestamp="2026-01-01T12:00:00"
         )
         self.assertEqual(result.host, "192.168.1.1")
         self.assertEqual(result.port, 22)
@@ -57,7 +57,7 @@ class TestScanResult(unittest.TestCase):
             username="root",
             password="toor",
             success=True,
-            timestamp="2024-01-01T12:00:00",
+            timestamp="2026-01-01T12:00:00",
             initial_output="Welcome to Ubuntu 22.04 LTS",
             banner="SSH-2.0-OpenSSH_8.9"
         )
@@ -72,7 +72,7 @@ class TestScanResult(unittest.TestCase):
             username="user",
             password="pass",
             success=False,
-            timestamp="2024-01-01T12:00:00",
+            timestamp="2026-01-01T12:00:00",
             error_message="Connection refused"
         )
         data = result.to_dict()
@@ -100,8 +100,8 @@ class TestScanStatistics(unittest.TestCase):
         """Test duration calculation."""
         from datetime import datetime, timedelta
         stats = ScanStatistics()
-        stats.start_time = datetime(2024, 1, 1, 12, 0, 0)
-        stats.end_time = datetime(2024, 1, 1, 12, 1, 30)
+        stats.start_time = datetime(2026, 1, 1, 12, 0, 0)
+        stats.end_time = datetime(2026, 1, 1, 12, 1, 30)
         self.assertEqual(stats.get_duration(), 90.0)
 
     def test_statistics_duration_no_times(self):
@@ -331,7 +331,7 @@ class TestSSHAuditClientOutput(unittest.TestCase):
                 username="admin",
                 password="pass123",
                 success=True,
-                timestamp="2024-01-01T12:00:00",
+                timestamp="2026-01-01T12:00:00",
                 initial_output="Welcome",
                 banner="SSH-2.0-OpenSSH"
             ),
@@ -341,7 +341,7 @@ class TestSSHAuditClientOutput(unittest.TestCase):
                 username="root",
                 password="toor",
                 success=False,
-                timestamp="2024-01-01T12:00:01",
+                timestamp="2026-01-01T12:00:01",
                 error_message="Auth failed"
             )
         ]
@@ -349,8 +349,8 @@ class TestSSHAuditClientOutput(unittest.TestCase):
         self.client.stats.total_attempts = 2
         self.client.stats.successful_logins = 1
         self.client.stats.failed_logins = 1
-        self.client.stats.start_time = datetime(2024, 1, 1, 12, 0, 0)
-        self.client.stats.end_time = datetime(2024, 1, 1, 12, 0, 30)
+        self.client.stats.start_time = datetime(2026, 1, 1, 12, 0, 0)
+        self.client.stats.end_time = datetime(2026, 1, 1, 12, 0, 30)
 
     def tearDown(self):
         """Clean up temporary files."""

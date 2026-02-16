@@ -3201,5 +3201,169 @@ class TestSaveResultsPDF(unittest.TestCase):
             pass
 
 
+class TestOutputFormatCompleteness(unittest.TestCase):
+    """Test that all output formats include all ScanResult fields."""
+
+    def _make_client_with_full_result(self):
+        """Create a client with a result that has all fields populated."""
+        from datetime import datetime
+        client = SSHAuditClient(score_passwords=True, detect_honeypot=True)
+        client.stats.start_time = datetime(2026, 1, 1, 12, 0, 0)
+        client.stats.end_time = datetime(2026, 1, 1, 12, 5, 0)
+        client.stats.total_attempts = 1
+        client.stats.successful_logins = 1
+        client.results = [
+            ScanResult(
+                host="10.0.0.1", port=22, username="root",
+                password="toor", success=True,
+                timestamp="2026-01-01T12:00:00",
+                banner="SSH-2.0-OpenSSH_8.9",
+                severity="critical",
+                severity_reasons=["Root login with password"],
+                host_key_type="ssh-ed25519",
+                host_key_fingerprint="SHA256:abc123",
+                host_key_bits=256,
+                os_info="Ubuntu", os_family="Linux",
+                ssh_version="OpenSSH_8.9",
+                honeypot_score=0.7,
+                honeypot_reasons=["Known Cowrie banner"],
+                host_key_changed=True,
+                host_key_previous="SHA256:old_key",
+                password_strength_score=15.0,
+                password_strength_label="very_weak",
+            ),
+        ]
+        return client
+
+    def test_text_output_includes_honeypot(self):
+        """Test that text output includes honeypot data."""
+        client = self._make_client_with_full_result()
+        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_text(Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('Honeypot score: 0.7', content)
+            self.assertIn('Known Cowrie banner', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_text_output_includes_mitm(self):
+        """Test that text output includes MITM/host key change data."""
+        client = self._make_client_with_full_result()
+        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_text(Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('HOST KEY CHANGED', content)
+            self.assertIn('SHA256:old_key', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_text_output_includes_password_strength(self):
+        """Test that text output includes password strength data."""
+        client = self._make_client_with_full_result()
+        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_text(Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('Password Strength:', content)
+            self.assertIn('VERY_WEAK', content)
+            self.assertIn('15/100', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_csv_output_includes_all_fields(self):
+        """Test that CSV output includes all ScanResult fields."""
+        client = self._make_client_with_full_result()
+        with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_csv(Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            # Check header has new fields
+            self.assertIn('honeypot_score', content)
+            self.assertIn('honeypot_reasons', content)
+            self.assertIn('host_key_changed', content)
+            self.assertIn('host_key_previous', content)
+            self.assertIn('password_strength_score', content)
+            self.assertIn('password_strength_label', content)
+            self.assertIn('host_key_bits', content)
+            self.assertIn('os_family', content)
+            self.assertIn('severity_reasons', content)
+            # Check data values are present
+            self.assertIn('Known Cowrie banner', content)
+            self.assertIn('very_weak', content)
+            self.assertIn('SHA256:old_key', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_xml_output_includes_honeypot(self):
+        """Test that XML output includes honeypot data."""
+        client = self._make_client_with_full_result()
+        with tempfile.NamedTemporaryFile(suffix='.xml', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_xml(Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('<honeypot_score>0.7</honeypot_score>', content)
+            self.assertIn('Known Cowrie banner', content)
+            self.assertIn('<host_key_changed>true</host_key_changed>', content)
+            self.assertIn('<host_key_previous>SHA256:old_key</host_key_previous>', content)
+            self.assertIn('<password_strength_score>15.0</password_strength_score>', content)
+            self.assertIn('<password_strength_label>very_weak</password_strength_label>', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_html_output_includes_honeypot(self):
+        """Test that HTML output includes honeypot data."""
+        client = self._make_client_with_full_result()
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_html(Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('honeypot', content.lower())
+            self.assertIn('0.7', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_html_output_includes_mitm(self):
+        """Test that HTML output includes MITM detection."""
+        client = self._make_client_with_full_result()
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_html(Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('HOST KEY CHANGED', content)
+            self.assertIn('SHA256:old_key', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_html_output_includes_password_strength(self):
+        """Test that HTML output includes password strength."""
+        client = self._make_client_with_full_result()
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_html(Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('Password Strength', content)
+            self.assertIn('VERY_WEAK', content)
+        finally:
+            os.unlink(tmp_path)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

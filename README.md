@@ -21,7 +21,13 @@ A Python-based SSH security audit tool for testing login capabilities across mul
 - **Nmap XML import**: Import targets from Nmap scan results
 - **Command execution**: Run commands on successful login and capture output
 - **Output capture**: Captures SSH banners and initial shell output (welcome messages, prompts)
-- **Multiple output formats**: Text, JSON, CSV, XML, and HTML report output
+- **Source IP binding**: Bind outgoing connections to a specific network interface/IP
+- **Service discovery**: TCP connect scan to discover SSH ports before brute-forcing
+- **Password strength scoring**: Score password strength when login succeeds (0-100 with labels)
+- **Jitter/randomization**: Add random delay between attempts to avoid IDS detection
+- **Differential/delta output**: Output only changes between current and baseline scan
+- **PDF report generation**: Generate PDF security audit reports
+- **Multiple output formats**: Text, JSON, CSV, XML, HTML, and PDF report output
 - **Configuration files**: YAML or JSON config files for reusable scan profiles
 - **Resume/checkpoint**: Save scan progress and resume interrupted scans
 - **Account lockout protection**: Limit failed attempts per user to avoid lockouts
@@ -103,7 +109,7 @@ pip install pyyaml          # Optional: for YAML config files
 | Option | Description |
 |--------|-------------|
 | `-o, --output FILE` | Save results to specified file |
-| `-f, --format FORMAT` | Output format: `text`, `json`, `csv`, `xml`, or `html`. Default: `text` |
+| `-f, --format FORMAT` | Output format: `text`, `json`, `csv`, `xml`, `html`, or `pdf`. Default: `text` |
 | `-v, --verbose` | Enable verbose output with detailed error messages |
 | `-q, --quiet` | Suppress progress output, only show summary |
 
@@ -145,12 +151,38 @@ pip install pyyaml          # Optional: for YAML config files
 |--------|-------------|
 | `--config FILE` | Load configuration from YAML or JSON file. CLI arguments override config file values. |
 
+#### Network Options
+
+| Option | Description |
+|--------|-------------|
+| `--source-ip IP` | Bind to a specific source IP address for outgoing connections. Useful for testing from different network interfaces or VLANs. |
+
+#### Service Discovery
+
+| Option | Description |
+|--------|-------------|
+| `--scan-ports` | Discover SSH services before scanning. Performs TCP connect scan on common SSH ports to find SSH services. |
+| `--discovery-ports PORTS` | Comma-separated list of ports to check during discovery. Default: 22,2222,2200,22222,8022,830,222,2022,2220,10022 |
+
+#### Differential Output
+
+| Option | Description |
+|--------|-------------|
+| `--diff` | Enable differential/delta output mode. When used with `--baseline`, the output file contains only changes between scans instead of the full report. |
+
+#### Password Analysis
+
+| Option | Description |
+|--------|-------------|
+| `--score-passwords` | Score password strength for successful logins. Reports a 0-100 score with labels (very_weak, weak, moderate, strong, very_strong). |
+
 #### Performance Options
 
 | Option | Description |
 |--------|-------------|
 | `-n, --threads NUM` | Number of concurrent threads. Default: 1 |
 | `--timeout SECONDS` | Connection timeout in seconds. Default: 10 |
+| `--jitter SECONDS` | Add random delay (0 to SECONDS) between connection attempts. Helps avoid rate limiting and IDS detection. Default: 0 |
 
 #### Other Options
 
@@ -271,6 +303,47 @@ nmap -p 22,2222 -sV -oX scan.xml 192.168.1.0/24
 
 # Later, run again with baseline comparison
 ./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt --baseline baseline.json -o current.json -f json
+```
+
+### Scan with source IP binding
+
+```bash
+./sshcheck.py -t 192.168.1.0/24 -u root -p pass --source-ip 10.0.0.5
+```
+
+### Jitter between connection attempts
+
+```bash
+./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt --jitter 2.0
+```
+
+### Password strength scoring
+
+```bash
+./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt --score-passwords
+```
+
+### Generate PDF report
+
+```bash
+./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt -f pdf -o report.pdf --score-passwords
+```
+
+### Discover SSH ports before scanning
+
+```bash
+./sshcheck.py -t 192.168.1.0/24 --scan-ports -U users.txt -P passwords.txt
+./sshcheck.py -t 192.168.1.1 --scan-ports --discovery-ports 22,2222,8022 -u root -p pass
+```
+
+### Differential/delta output
+
+```bash
+# First scan: save baseline
+./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt -o baseline.json -f json
+
+# Second scan: output only changes
+./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt --baseline baseline.json --diff -o changes.json -f json
 ```
 
 ## Configuration File
@@ -408,6 +481,15 @@ Styled HTML report with:
 - Command output display
 - Color-coded severity levels (critical/high/medium/low/info)
 
+### PDF Format
+
+Self-contained PDF report generated with no external dependencies:
+- Scan statistics summary
+- Successful logins with full details
+- Password strength scores (when enabled)
+- All scan results listing
+- Multi-page support for large scans
+
 ## Credential Spray Mode
 
 In normal mode, sshcheck tries all passwords for a given user on a host before moving on. This can trigger account lockouts in enterprise environments.
@@ -453,6 +535,66 @@ The `--baseline` option compares current scan results against a previous scan to
 - **SSH version changes**: Software version upgrades or downgrades
 
 A diff report is printed to stdout and saved as a `.diff.json` file alongside the output file.
+
+## Source IP Binding
+
+The `--source-ip` option binds all outgoing connections (banner grabbing, SSH connections) to a specific local IP address. This is useful when:
+
+- Testing from a multi-homed machine with multiple network interfaces
+- Scanning from a specific VLAN or network segment
+- Ensuring traffic routes through a particular path
+
+## Jitter/Randomization
+
+The `--jitter` option adds a random delay (from 0 to the specified value in seconds) between each connection attempt. Benefits include:
+
+- Avoiding rate limiting and connection throttling
+- Reducing likelihood of triggering IDS/IPS alerts
+- Mimicking more natural traffic patterns
+- Works in both single-threaded and multi-threaded modes
+
+## Password Strength Scoring
+
+When `--score-passwords` is enabled, every successful login is scored on a 0-100 scale:
+
+| Score Range | Label | Description |
+|-------------|-------|-------------|
+| 80-100 | VERY_STRONG | Excellent password with high entropy |
+| 60-79 | STRONG | Good password with diverse characters |
+| 40-59 | MODERATE | Acceptable but could be stronger |
+| 20-39 | WEAK | Easily guessable or short |
+| 0-19 | VERY_WEAK | Trivial, common, or empty password |
+
+The scoring evaluates: length, character class diversity (upper, lower, digits, special), entropy, common password lists, username similarity, sequential characters, and repeated patterns.
+
+## Service Discovery
+
+The `--scan-ports` option performs a TCP connect scan on common SSH ports before the main credential scan. It:
+
+- Discovers SSH services on non-standard ports automatically
+- Grabs SSH banners to confirm the service
+- Adds discovered ports to the scan target list
+- Default ports scanned: 22, 2222, 2200, 22222, 8022, 830, 222, 2022, 2220, 10022
+- Custom ports can be specified with `--discovery-ports`
+
+## Differential Output
+
+The `--diff` option (used with `--baseline`) changes the output to contain **only changes** between the current scan and the baseline:
+
+- Supports JSON, CSV, and text output formats
+- Shows new/removed hosts, credentials, host key and version changes
+- Ideal for automated monitoring and alerting pipelines
+- Much smaller output than full reports when tracking changes over time
+
+## PDF Report
+
+The `--format pdf` option generates a PDF security audit report with no external dependencies. The PDF includes:
+
+- Scan statistics and summary
+- Successful logins with severity, host keys, OS info
+- Password strength scores (if `--score-passwords` enabled)
+- Honeypot and MITM detection results
+- All scan results listing
 
 ## Nmap XML Import
 

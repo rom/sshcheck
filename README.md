@@ -364,6 +364,14 @@ sshcheck supports JSON and YAML configuration files. CLI arguments override conf
   "user_as_pass": true,
   "stop_on_success": true,
   "max_attempts_per_user": 3,
+  "spray": false,
+  "detect_honeypot": true,
+  "known_hosts": "known_hosts.json",
+  "score_passwords": true,
+  "jitter": 1.0,
+  "scan_ports": false,
+  "source_ip": null,
+  "diff_mode": false,
   "command": "id; uname -a",
   "format": "html",
   "output": "audit_report.html",
@@ -393,6 +401,12 @@ try_empty: true
 user_as_pass: true
 stop_on_success: true
 max_attempts_per_user: 3
+spray: false
+detect_honeypot: true
+known_hosts: known_hosts.json
+score_passwords: true
+jitter: 1.0
+scan_ports: false
 command: "id; uname -a"
 format: html
 output: audit_report.html
@@ -466,11 +480,11 @@ Structured JSON with full scan details including host key info, algorithms, OS f
 
 ### CSV Format
 
-Comma-separated values with columns for all fields including new security assessment data.
+Comma-separated values with columns for all ScanResult fields including host key info, OS fingerprinting, severity reasons, honeypot detection, MITM detection, and password strength scores.
 
 ### XML Format
 
-Structured XML output suitable for integration with other security tools.
+Structured XML output with full scan details including algorithms, severity reasons, honeypot scores, host key change detection, and password strength data. Suitable for integration with other security tools.
 
 ### HTML Format
 

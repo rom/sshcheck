@@ -1938,14 +1938,25 @@ class SSHAuditClient:
                 'host', 'port', 'username', 'password', 'success',
                 'timestamp', 'banner', 'initial_output', 'error_message',
                 'connection_time', 'host_key_type', 'host_key_fingerprint',
-                'os_info', 'ssh_version', 'severity', 'command_output'
+                'host_key_bits', 'os_info', 'os_family', 'ssh_version',
+                'severity', 'severity_reasons', 'command_output',
+                'honeypot_score', 'honeypot_reasons',
+                'host_key_changed', 'host_key_previous',
+                'password_strength_score', 'password_strength_label'
             ])
             for r in self.results:
                 writer.writerow([
                     r.host, r.port, r.username, r.password, r.success,
                     r.timestamp, r.banner, r.initial_output, r.error_message,
                     r.connection_time, r.host_key_type, r.host_key_fingerprint,
-                    r.os_info, r.ssh_version, r.severity, r.command_output
+                    r.host_key_bits, r.os_info, r.os_family, r.ssh_version,
+                    r.severity,
+                    '; '.join(r.severity_reasons) if r.severity_reasons else '',
+                    r.command_output,
+                    r.honeypot_score,
+                    '; '.join(r.honeypot_reasons) if r.honeypot_reasons else '',
+                    r.host_key_changed, r.host_key_previous,
+                    r.password_strength_score, r.password_strength_label
                 ])
 
     def _save_xml(self, path: Path):
@@ -1996,6 +2007,16 @@ class SSHAuditClient:
             ET.SubElement(result_elem, "ssh_version").text = r.ssh_version or ""
             ET.SubElement(result_elem, "severity").text = r.severity or ""
             ET.SubElement(result_elem, "command_output").text = r.command_output or ""
+            ET.SubElement(result_elem, "honeypot_score").text = str(r.honeypot_score)
+            ET.SubElement(result_elem, "host_key_changed").text = str(r.host_key_changed).lower()
+            ET.SubElement(result_elem, "host_key_previous").text = r.host_key_previous or ""
+            ET.SubElement(result_elem, "password_strength_score").text = str(r.password_strength_score)
+            ET.SubElement(result_elem, "password_strength_label").text = r.password_strength_label or ""
+
+            if r.honeypot_reasons:
+                hp_reasons_elem = ET.SubElement(result_elem, "honeypot_reasons")
+                for reason in r.honeypot_reasons:
+                    ET.SubElement(hp_reasons_elem, "reason").text = reason
 
             if r.severity_reasons:
                 reasons_elem = ET.SubElement(result_elem, "severity_reasons")
@@ -2107,6 +2128,29 @@ pre {{ background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto;
                     reasons_html = "".join(f"<span class='tag'>{e(reason)}</span> " for reason in r.severity_reasons)
                     html += f"<tr><td colspan='7'>{reasons_html}</td></tr>\n"
 
+                if r.host_key_changed:
+                    html += (f"<tr><td colspan='7' style='color:#dc3545;font-weight:bold'>"
+                             f"⚠ HOST KEY CHANGED - possible MITM attack! "
+                             f"Previous: {e(r.host_key_previous)}</td></tr>\n")
+
+                if r.honeypot_score >= 0.5:
+                    hp_detail = ', '.join(e(hr) for hr in (r.honeypot_reasons or []))
+                    html += (f"<tr><td colspan='7' style='color:#fd7e14'>"
+                             f"⚠ Possible honeypot (score: {r.honeypot_score:.1f}) — {hp_detail}"
+                             f"</td></tr>\n")
+
+                if r.password_strength_label:
+                    pw_colors = {
+                        "very_weak": "#dc3545", "weak": "#dc3545",
+                        "moderate": "#ffc107", "strong": "#28a745",
+                        "very_strong": "#28a745",
+                    }
+                    pw_color = pw_colors.get(r.password_strength_label, "#6c757d")
+                    html += (f"<tr><td colspan='7'>Password Strength: "
+                             f"<span style='color:{pw_color};font-weight:bold'>"
+                             f"{e(r.password_strength_label.upper())}</span> "
+                             f"({r.password_strength_score:.0f}/100)</td></tr>\n")
+
                 if r.command_output:
                     html += f"<tr><td colspan='7'><strong>Command Output:</strong><pre>{e(r.command_output[:500])}</pre></td></tr>\n"
                 elif r.initial_output:
@@ -2185,6 +2229,15 @@ pre {{ background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto;
                         f.write(f"Findings:\n")
                         for reason in r.severity_reasons:
                             f.write(f"  - {reason}\n")
+                    if r.host_key_changed:
+                        f.write(f"!!! HOST KEY CHANGED - possible MITM attack !!!\n")
+                        f.write(f"Previous fingerprint: {r.host_key_previous}\n")
+                    if r.honeypot_score >= 0.5:
+                        f.write(f"Honeypot score: {r.honeypot_score:.1f}\n")
+                        for hr in (r.honeypot_reasons or []):
+                            f.write(f"  - {hr}\n")
+                    if r.password_strength_label:
+                        f.write(f"Password Strength: {r.password_strength_label.upper()} ({r.password_strength_score:.0f}/100)\n")
                     if r.command_output:
                         f.write(f"Command Output:\n{r.command_output}\n")
                     elif r.initial_output:
@@ -3033,7 +3086,7 @@ def main():
 
     # Import targets from Nmap XML if specified
     nmap_targets = []
-    if hasattr(args, 'import_nmap') and args.import_nmap:
+    if args.import_nmap:
         try:
             nmap_results = SSHAuditClient.import_nmap_xml(args.import_nmap)
             if nmap_results:
@@ -3044,11 +3097,9 @@ def main():
                         nmap_targets.append(h)
                         try:
                             port_num = int(p)
-                            if not hasattr(args, 'ports') or args.ports is None:
+                            if args.ports is None:
                                 args.ports = []
-                            if port_num not in (args.ports or []):
-                                if args.ports is None:
-                                    args.ports = []
+                            if port_num not in args.ports:
                                 args.ports.append(port_num)
                         except ValueError:
                             pass
@@ -3161,9 +3212,9 @@ def main():
 
     # Collect excluded hosts
     exclude_hosts = []
-    if hasattr(args, 'exclude_hosts') and args.exclude_hosts:
+    if args.exclude_hosts:
         exclude_hosts.extend(args.exclude_hosts)
-    if hasattr(args, 'exclude_file') and args.exclude_file:
+    if args.exclude_file:
         try:
             client = SSHAuditClient()
             exclude_hosts.extend(client._read_file_lines(args.exclude_file, "exclude"))
@@ -3206,7 +3257,7 @@ def main():
         sys.exit(1)
 
     # Validate jitter
-    jitter_val = getattr(args, 'jitter', 0.0)
+    jitter_val = args.jitter
     if jitter_val < 0:
         print(
             "ERROR: --jitter must be >= 0.\n"
@@ -3216,7 +3267,7 @@ def main():
         sys.exit(1)
 
     # Validate source IP
-    source_ip = getattr(args, 'source_ip', None)
+    source_ip = args.source_ip
     if source_ip:
         try:
             ipaddress.ip_address(source_ip)
@@ -3229,8 +3280,8 @@ def main():
             sys.exit(1)
 
     # Validate diff mode requires baseline
-    diff_mode = getattr(args, 'diff_mode', False)
-    if diff_mode and not getattr(args, 'baseline', None):
+    diff_mode = args.diff_mode
+    if diff_mode and not args.baseline:
         print(
             "ERROR: --diff requires --baseline to be specified.\n"
             "The diff mode compares against a previous scan baseline.",
@@ -3239,9 +3290,9 @@ def main():
         sys.exit(1)
 
     # Service discovery: scan for SSH ports before main scan
-    if getattr(args, 'scan_ports', False):
+    if args.scan_ports:
         discovery_ports = None
-        if getattr(args, 'discovery_ports', None):
+        if args.discovery_ports:
             try:
                 discovery_ports = [
                     int(p.strip()) for p in args.discovery_ports.split(',')
@@ -3293,14 +3344,14 @@ def main():
         max_attempts_per_user=args.max_attempts_per_user,
         command=args.command,
         checkpoint_file=checkpoint_file,
-        spray_mode=getattr(args, 'spray', False),
+        spray_mode=args.spray,
         exclude_hosts=exclude_hosts if exclude_hosts else None,
-        detect_honeypot=getattr(args, 'detect_honeypot', False),
-        known_hosts_file=getattr(args, 'known_hosts', None),
-        baseline_file=getattr(args, 'baseline', None),
+        detect_honeypot=args.detect_honeypot,
+        known_hosts_file=args.known_hosts,
+        baseline_file=args.baseline,
         source_ip=source_ip,
         jitter=jitter_val,
-        score_passwords=getattr(args, 'score_passwords', False),
+        score_passwords=args.score_passwords,
         diff_mode=diff_mode,
     )
 

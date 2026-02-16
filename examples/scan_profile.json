@@ -1,0 +1,28 @@
+{
+  "targets": [
+    "192.168.1.0/24"
+  ],
+  "users": [
+    "root",
+    "admin",
+    "ubuntu",
+    "ec2-user"
+  ],
+  "passwords": [
+    "password",
+    "admin",
+    "123456",
+    "changeme"
+  ],
+  "ports": [22, 2222],
+  "threads": 10,
+  "timeout": 15,
+  "try_empty": true,
+  "user_as_pass": true,
+  "stop_on_success": true,
+  "max_attempts_per_user": 3,
+  "command": "id; uname -a; cat /etc/hostname",
+  "format": "html",
+  "output": "audit_report.html",
+  "checkpoint": "scan_checkpoint.json"
+}

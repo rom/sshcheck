@@ -22,7 +22,14 @@ from sshcheck import (
     SSHAuditClient,
     ScanResult,
     ScanStatistics,
+    SeverityLevel,
+    VULNERABLE_VERSIONS,
+    WEAK_ALGORITHMS,
+    OS_FINGERPRINTS,
     parse_arguments,
+    load_config_file,
+    apply_config,
+    _severity_rank,
     __version__,
     __program_name__
 )
@@ -48,6 +55,11 @@ class TestScanResult(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.initial_output, "")
         self.assertEqual(result.error_message, "")
+        self.assertEqual(result.host_key_type, "")
+        self.assertEqual(result.host_key_fingerprint, "")
+        self.assertEqual(result.os_info, "")
+        self.assertEqual(result.severity, "")
+        self.assertEqual(result.command_output, "")
 
     def test_scan_result_with_output(self):
         """Test creating a ScanResult with initial output."""
@@ -63,6 +75,34 @@ class TestScanResult(unittest.TestCase):
         )
         self.assertEqual(result.initial_output, "Welcome to Ubuntu 22.04 LTS")
         self.assertEqual(result.banner, "SSH-2.0-OpenSSH_8.9")
+
+    def test_scan_result_with_new_fields(self):
+        """Test creating a ScanResult with new v2 fields."""
+        result = ScanResult(
+            host="192.168.1.1",
+            port=22,
+            username="root",
+            password="toor",
+            success=True,
+            timestamp="2026-01-01T12:00:00",
+            host_key_type="ssh-ed25519",
+            host_key_fingerprint="SHA256:ab:cd:ef",
+            host_key_bits=256,
+            os_info="Ubuntu Linux",
+            os_family="Linux",
+            ssh_version="OpenSSH_8.9p1 Ubuntu-3",
+            severity="critical",
+            severity_reasons=["Root login successful"],
+            command_output="uid=0(root) gid=0(root)",
+            algorithms={"kex": ["curve25519-sha256"]},
+            weak_algorithms={"ciphers": ["aes128-cbc: CBC mode"]}
+        )
+        self.assertEqual(result.host_key_type, "ssh-ed25519")
+        self.assertEqual(result.host_key_bits, 256)
+        self.assertEqual(result.os_info, "Ubuntu Linux")
+        self.assertEqual(result.severity, "critical")
+        self.assertEqual(result.command_output, "uid=0(root) gid=0(root)")
+        self.assertEqual(len(result.severity_reasons), 1)
 
     def test_scan_result_to_dict(self):
         """Test converting ScanResult to dictionary."""
@@ -81,6 +121,10 @@ class TestScanResult(unittest.TestCase):
         self.assertEqual(data['port'], 2222)
         self.assertFalse(data['success'])
         self.assertEqual(data['error_message'], "Connection refused")
+        # None values should be converted to empty structures
+        self.assertEqual(data['algorithms'], {})
+        self.assertEqual(data['weak_algorithms'], {})
+        self.assertEqual(data['severity_reasons'], [])
 
 
 class TestScanStatistics(unittest.TestCase):
@@ -93,6 +137,8 @@ class TestScanStatistics(unittest.TestCase):
         self.assertEqual(stats.successful_logins, 0)
         self.assertEqual(stats.failed_logins, 0)
         self.assertEqual(stats.connection_errors, 0)
+        self.assertEqual(stats.skipped_lockout, 0)
+        self.assertEqual(stats.skipped_stop_on_success, 0)
         self.assertIsNone(stats.start_time)
         self.assertIsNone(stats.end_time)
 
@@ -108,6 +154,321 @@ class TestScanStatistics(unittest.TestCase):
         """Test duration with no start/end times."""
         stats = ScanStatistics()
         self.assertEqual(stats.get_duration(), 0.0)
+
+
+class TestSeverity(unittest.TestCase):
+    """Test cases for severity levels and scoring."""
+
+    def test_severity_levels(self):
+        """Test SeverityLevel enum values."""
+        self.assertEqual(SeverityLevel.CRITICAL.value, "critical")
+        self.assertEqual(SeverityLevel.HIGH.value, "high")
+        self.assertEqual(SeverityLevel.MEDIUM.value, "medium")
+        self.assertEqual(SeverityLevel.LOW.value, "low")
+        self.assertEqual(SeverityLevel.INFO.value, "info")
+
+    def test_severity_rank(self):
+        """Test severity ranking function."""
+        self.assertGreater(_severity_rank(SeverityLevel.CRITICAL), _severity_rank(SeverityLevel.HIGH))
+        self.assertGreater(_severity_rank(SeverityLevel.HIGH), _severity_rank(SeverityLevel.MEDIUM))
+        self.assertGreater(_severity_rank(SeverityLevel.MEDIUM), _severity_rank(SeverityLevel.LOW))
+        self.assertGreater(_severity_rank(SeverityLevel.LOW), _severity_rank(SeverityLevel.INFO))
+
+    def test_severity_root_login(self):
+        """Test severity for root login."""
+        client = SSHAuditClient()
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="toor", success=True, timestamp="2026-01-01T12:00:00"
+        )
+        severity, reasons = client._assess_severity(result)
+        self.assertEqual(severity, "critical")
+        self.assertTrue(any("Root/admin" in r for r in reasons))
+
+    def test_severity_empty_password(self):
+        """Test severity for empty password login."""
+        client = SSHAuditClient()
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="user1",
+            password="", success=True, timestamp="2026-01-01T12:00:00"
+        )
+        severity, reasons = client._assess_severity(result)
+        self.assertEqual(severity, "critical")
+        self.assertTrue(any("Empty/null" in r for r in reasons))
+
+    def test_severity_user_as_password(self):
+        """Test severity for username-as-password."""
+        client = SSHAuditClient()
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="admin",
+            password="admin", success=True, timestamp="2026-01-01T12:00:00"
+        )
+        severity, reasons = client._assess_severity(result)
+        self.assertEqual(severity, "critical")
+        self.assertTrue(any("Username used as password" in r for r in reasons))
+
+    def test_severity_normal_user(self):
+        """Test severity for normal user login with non-default password."""
+        client = SSHAuditClient()
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="john",
+            password="s3cur3P@ss!", success=True, timestamp="2026-01-01T12:00:00"
+        )
+        severity, reasons = client._assess_severity(result)
+        self.assertEqual(severity, "high")
+
+    def test_severity_failed_login(self):
+        """Test severity for failed login."""
+        client = SSHAuditClient()
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="wrong", success=False, timestamp="2026-01-01T12:00:00"
+        )
+        severity, reasons = client._assess_severity(result)
+        self.assertEqual(severity, "info")
+
+    def test_severity_weak_host_key(self):
+        """Test severity for weak DSA host key."""
+        client = SSHAuditClient()
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="user",
+            password="wrong", success=False, timestamp="2026-01-01T12:00:00",
+            host_key_type="ssh-dss"
+        )
+        severity, reasons = client._assess_severity(result)
+        self.assertTrue(any("DSA" in r for r in reasons))
+
+    def test_severity_weak_algorithms(self):
+        """Test severity for weak algorithms."""
+        client = SSHAuditClient()
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="user",
+            password="wrong", success=False, timestamp="2026-01-01T12:00:00",
+            weak_algorithms={"ciphers": ["arcfour: RC4 stream cipher, broken"]}
+        )
+        severity, reasons = client._assess_severity(result)
+        self.assertTrue(any("weak algorithm" in r for r in reasons))
+
+
+class TestOSFingerprinting(unittest.TestCase):
+    """Test cases for OS fingerprinting from banners."""
+
+    def setUp(self):
+        self.client = SSHAuditClient()
+
+    def test_ubuntu_banner(self):
+        """Test Ubuntu detection."""
+        os_info, os_family, ssh_ver = self.client._fingerprint_os(
+            "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3"
+        )
+        self.assertEqual(os_info, "Ubuntu Linux")
+        self.assertEqual(os_family, "Linux")
+        self.assertIn("OpenSSH_8.9p1", ssh_ver)
+
+    def test_debian_banner(self):
+        """Test Debian detection."""
+        os_info, os_family, _ = self.client._fingerprint_os(
+            "SSH-2.0-OpenSSH_8.4p1 Debian-5+deb11u1"
+        )
+        self.assertEqual(os_info, "Debian Linux")
+        self.assertEqual(os_family, "Linux")
+
+    def test_freebsd_banner(self):
+        """Test FreeBSD detection."""
+        os_info, os_family, _ = self.client._fingerprint_os(
+            "SSH-2.0-OpenSSH_8.8 FreeBSD-20211221"
+        )
+        self.assertEqual(os_info, "FreeBSD")
+        self.assertEqual(os_family, "BSD")
+
+    def test_dropbear_banner(self):
+        """Test Dropbear (embedded) detection."""
+        os_info, os_family, _ = self.client._fingerprint_os(
+            "SSH-2.0-dropbear_2020.81"
+        )
+        self.assertEqual(os_family, "Embedded")
+
+    def test_windows_banner(self):
+        """Test Windows detection."""
+        os_info, os_family, _ = self.client._fingerprint_os(
+            "SSH-2.0-OpenSSH_for_Windows_8.1"
+        )
+        self.assertEqual(os_family, "Windows")
+
+    def test_empty_banner(self):
+        """Test empty banner."""
+        os_info, os_family, ssh_ver = self.client._fingerprint_os("")
+        self.assertEqual(os_info, "")
+        self.assertEqual(os_family, "")
+        self.assertEqual(ssh_ver, "")
+
+    def test_generic_openssh(self):
+        """Test generic OpenSSH banner."""
+        os_info, os_family, _ = self.client._fingerprint_os(
+            "SSH-2.0-OpenSSH_9.0"
+        )
+        self.assertEqual(os_info, "OpenSSH (generic)")
+        self.assertEqual(os_family, "Unix")
+
+    def test_ssh_version_extraction(self):
+        """Test SSH version extraction from banner."""
+        _, _, ssh_ver = self.client._fingerprint_os("SSH-2.0-OpenSSH_8.9p1 Ubuntu-3")
+        self.assertEqual(ssh_ver, "OpenSSH_8.9p1 Ubuntu-3")
+
+
+class TestWeakAlgorithms(unittest.TestCase):
+    """Test cases for weak algorithm detection."""
+
+    def setUp(self):
+        self.client = SSHAuditClient()
+
+    def test_find_weak_kex(self):
+        """Test detection of weak key exchange algorithms."""
+        algorithms = {
+            'kex': ['curve25519-sha256', 'diffie-hellman-group1-sha1'],
+            'ciphers': ['aes256-ctr'],
+            'digests': ['hmac-sha2-256'],
+            'key_types': ['ssh-ed25519'],
+        }
+        weak = self.client._find_weak_algorithms(algorithms)
+        self.assertIn('kex', weak)
+        self.assertEqual(len(weak['kex']), 1)
+        self.assertIn('diffie-hellman-group1-sha1', weak['kex'][0])
+
+    def test_find_weak_ciphers(self):
+        """Test detection of weak ciphers."""
+        algorithms = {
+            'ciphers': ['aes256-ctr', 'arcfour', '3des-cbc'],
+        }
+        weak = self.client._find_weak_algorithms(algorithms)
+        self.assertIn('ciphers', weak)
+        self.assertEqual(len(weak['ciphers']), 2)
+
+    def test_find_weak_macs(self):
+        """Test detection of weak MAC algorithms."""
+        algorithms = {
+            'digests': ['hmac-sha2-256', 'hmac-md5', 'hmac-sha1'],
+        }
+        weak = self.client._find_weak_algorithms(algorithms)
+        self.assertIn('digests', weak)
+        self.assertEqual(len(weak['digests']), 2)
+
+    def test_no_weak_algorithms(self):
+        """Test when no weak algorithms are present."""
+        algorithms = {
+            'kex': ['curve25519-sha256'],
+            'ciphers': ['aes256-gcm@openssh.com'],
+            'digests': ['hmac-sha2-256'],
+            'key_types': ['ssh-ed25519'],
+        }
+        weak = self.client._find_weak_algorithms(algorithms)
+        self.assertEqual(len(weak), 0)
+
+    def test_empty_algorithms(self):
+        """Test with empty algorithm dict."""
+        weak = self.client._find_weak_algorithms({})
+        self.assertEqual(len(weak), 0)
+
+
+class TestPasswordListBuilding(unittest.TestCase):
+    """Test cases for password list building with try_empty and user_as_pass."""
+
+    def test_normal_passwords(self):
+        """Test normal password list without extras."""
+        client = SSHAuditClient()
+        pw_list = client._build_password_list(["pass1", "pass2"], "admin")
+        self.assertEqual(pw_list, ["pass1", "pass2"])
+
+    def test_try_empty(self):
+        """Test that empty password is prepended."""
+        client = SSHAuditClient(try_empty=True)
+        pw_list = client._build_password_list(["pass1"], "admin")
+        self.assertEqual(pw_list[0], "")
+        self.assertEqual(len(pw_list), 2)
+
+    def test_try_empty_already_present(self):
+        """Test that empty password is not duplicated."""
+        client = SSHAuditClient(try_empty=True)
+        pw_list = client._build_password_list(["", "pass1"], "admin")
+        self.assertEqual(pw_list.count(""), 1)
+
+    def test_user_as_pass(self):
+        """Test that username is prepended as password."""
+        client = SSHAuditClient(user_as_pass=True)
+        pw_list = client._build_password_list(["pass1"], "admin")
+        self.assertEqual(pw_list[0], "admin")
+        self.assertEqual(len(pw_list), 2)
+
+    def test_user_as_pass_already_present(self):
+        """Test that username is not duplicated in password list."""
+        client = SSHAuditClient(user_as_pass=True)
+        pw_list = client._build_password_list(["admin", "pass1"], "admin")
+        self.assertEqual(pw_list.count("admin"), 1)
+
+    def test_both_try_empty_and_user_as_pass(self):
+        """Test both flags together."""
+        client = SSHAuditClient(try_empty=True, user_as_pass=True)
+        pw_list = client._build_password_list(["pass1"], "admin")
+        self.assertIn("", pw_list)
+        self.assertIn("admin", pw_list)
+        self.assertIn("pass1", pw_list)
+
+
+class TestStopOnSuccess(unittest.TestCase):
+    """Test cases for stop-on-success functionality."""
+
+    def test_should_skip_after_success(self):
+        """Test that attempts are skipped after success for a host:port."""
+        client = SSHAuditClient(stop_on_success=True)
+        client._successful_hosts.add("192.168.1.1:22")
+        result = client._should_skip("192.168.1.1", 22, "root")
+        self.assertEqual(result, "stop_on_success")
+
+    def test_should_not_skip_different_host(self):
+        """Test that different host:port is not skipped."""
+        client = SSHAuditClient(stop_on_success=True)
+        client._successful_hosts.add("192.168.1.1:22")
+        result = client._should_skip("192.168.1.2", 22, "root")
+        self.assertIsNone(result)
+
+    def test_should_not_skip_when_disabled(self):
+        """Test that nothing is skipped when stop-on-success is disabled."""
+        client = SSHAuditClient(stop_on_success=False)
+        client._successful_hosts.add("192.168.1.1:22")
+        result = client._should_skip("192.168.1.1", 22, "root")
+        self.assertIsNone(result)
+
+
+class TestLockoutProtection(unittest.TestCase):
+    """Test cases for account lockout protection."""
+
+    def test_should_skip_after_max_attempts(self):
+        """Test that attempts are skipped after max failures."""
+        client = SSHAuditClient(max_attempts_per_user=3)
+        client._failure_counts["192.168.1.1:22:root"] = 3
+        result = client._should_skip("192.168.1.1", 22, "root")
+        self.assertEqual(result, "lockout_protection")
+
+    def test_should_not_skip_under_max(self):
+        """Test that attempts continue under max failures."""
+        client = SSHAuditClient(max_attempts_per_user=3)
+        client._failure_counts["192.168.1.1:22:root"] = 2
+        result = client._should_skip("192.168.1.1", 22, "root")
+        self.assertIsNone(result)
+
+    def test_should_not_skip_different_user(self):
+        """Test that different user is not affected by lockout."""
+        client = SSHAuditClient(max_attempts_per_user=3)
+        client._failure_counts["192.168.1.1:22:root"] = 5
+        result = client._should_skip("192.168.1.1", 22, "admin")
+        self.assertIsNone(result)
+
+    def test_should_not_skip_when_disabled(self):
+        """Test that nothing is skipped when lockout protection is disabled."""
+        client = SSHAuditClient(max_attempts_per_user=0)
+        client._failure_counts["192.168.1.1:22:root"] = 100
+        result = client._should_skip("192.168.1.1", 22, "root")
+        self.assertIsNone(result)
 
 
 class TestSSHAuditClientTargetParsing(unittest.TestCase):
@@ -250,19 +611,75 @@ class TestSSHAuditClientConnection(unittest.TestCase):
         # Mock successful connection
         mock_client.connect.return_value = None
 
+        # Mock transport for host key and algorithm info
+        mock_transport = MagicMock()
+        mock_key = MagicMock()
+        mock_key.get_name.return_value = "ssh-ed25519"
+        mock_key.asbytes.return_value = b"fake_key_bytes"
+        mock_key.get_bits.return_value = 256
+        mock_transport.get_remote_server_key.return_value = mock_key
+
+        mock_sec_opts = MagicMock()
+        mock_sec_opts.kex = ["curve25519-sha256"]
+        mock_sec_opts.ciphers = ["aes256-gcm@openssh.com"]
+        mock_sec_opts.digests = ["hmac-sha2-256"]
+        mock_sec_opts.key_types = ["ssh-ed25519"]
+        mock_transport.get_security_options.return_value = mock_sec_opts
+
+        mock_client.get_transport.return_value = mock_transport
+
         # Mock channel for initial output
         mock_channel = MagicMock()
         mock_channel.recv_ready.side_effect = [True, False]
         mock_channel.recv.return_value = b"Welcome to the server\n"
         mock_client.invoke_shell.return_value = mock_channel
 
-        with patch.object(self.client, '_get_ssh_banner', return_value="SSH-2.0-OpenSSH"):
+        with patch.object(self.client, '_get_ssh_banner', return_value="SSH-2.0-OpenSSH_8.9p1 Ubuntu-3"):
             result = self.client._try_login("192.168.1.1", 22, "admin", "password")
 
         self.assertTrue(result.success)
         self.assertEqual(result.host, "192.168.1.1")
         self.assertEqual(result.username, "admin")
-        self.assertEqual(result.banner, "SSH-2.0-OpenSSH")
+        self.assertEqual(result.banner, "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3")
+        self.assertEqual(result.host_key_type, "ssh-ed25519")
+        self.assertIn("SHA256:", result.host_key_fingerprint)
+        self.assertEqual(result.os_info, "Ubuntu Linux")
+        self.assertEqual(result.os_family, "Linux")
+
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_successful_login_with_command(self, mock_ssh_class):
+        """Test successful SSH login with command execution."""
+        self.client.command = "id"
+        mock_client = MagicMock()
+        mock_ssh_class.return_value = mock_client
+        mock_client.connect.return_value = None
+
+        mock_transport = MagicMock()
+        mock_key = MagicMock()
+        mock_key.get_name.return_value = "ssh-ed25519"
+        mock_key.asbytes.return_value = b"fake_key_bytes"
+        mock_key.get_bits.return_value = 256
+        mock_transport.get_remote_server_key.return_value = mock_key
+        mock_sec_opts = MagicMock()
+        mock_sec_opts.kex = []
+        mock_sec_opts.ciphers = []
+        mock_sec_opts.digests = []
+        mock_sec_opts.key_types = []
+        mock_transport.get_security_options.return_value = mock_sec_opts
+        mock_client.get_transport.return_value = mock_transport
+
+        # Mock exec_command
+        mock_stdout = MagicMock()
+        mock_stdout.read.return_value = b"uid=0(root) gid=0(root)\n"
+        mock_stderr = MagicMock()
+        mock_stderr.read.return_value = b""
+        mock_client.exec_command.return_value = (MagicMock(), mock_stdout, mock_stderr)
+
+        with patch.object(self.client, '_get_ssh_banner', return_value=""):
+            result = self.client._try_login("192.168.1.1", 22, "root", "pass")
+
+        self.assertTrue(result.success)
+        self.assertIn("uid=0(root)", result.command_output)
 
     @patch('sshcheck.paramiko.SSHClient')
     def test_authentication_failure(self, mock_ssh_class):
@@ -280,6 +697,19 @@ class TestSSHAuditClientConnection(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("Authentication failed", result.error_message)
         self.assertEqual(self.client.stats.authentication_errors, 1)
+
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_authentication_failure_tracks_lockout(self, mock_ssh_class):
+        """Test that auth failure increments lockout counter."""
+        import paramiko
+        mock_client = MagicMock()
+        mock_ssh_class.return_value = mock_client
+        mock_client.connect.side_effect = paramiko.AuthenticationException("Auth failed")
+
+        with patch.object(self.client, '_get_ssh_banner', return_value=""):
+            self.client._try_login("192.168.1.1", 22, "root", "wrongpass")
+
+        self.assertEqual(self.client._failure_counts["192.168.1.1:22:root"], 1)
 
     @patch('sshcheck.paramiko.SSHClient')
     def test_connection_timeout(self, mock_ssh_class):
@@ -333,7 +763,15 @@ class TestSSHAuditClientOutput(unittest.TestCase):
                 success=True,
                 timestamp="2026-01-01T12:00:00",
                 initial_output="Welcome",
-                banner="SSH-2.0-OpenSSH"
+                banner="SSH-2.0-OpenSSH_8.9p1 Ubuntu-3",
+                host_key_type="ssh-ed25519",
+                host_key_fingerprint="SHA256:ab:cd",
+                host_key_bits=256,
+                os_info="Ubuntu Linux",
+                os_family="Linux",
+                ssh_version="OpenSSH_8.9p1 Ubuntu-3",
+                severity="high",
+                severity_reasons=["Login successful for user 'admin'"],
             ),
             ScanResult(
                 host="192.168.1.2",
@@ -342,7 +780,9 @@ class TestSSHAuditClientOutput(unittest.TestCase):
                 password="toor",
                 success=False,
                 timestamp="2026-01-01T12:00:01",
-                error_message="Auth failed"
+                error_message="Auth failed",
+                severity="info",
+                severity_reasons=["No significant findings"],
             )
         ]
         from datetime import datetime
@@ -372,6 +812,10 @@ class TestSSHAuditClientOutput(unittest.TestCase):
         self.assertIn("results", data)
         self.assertEqual(len(data["results"]), 2)
         self.assertEqual(data["statistics"]["total_attempts"], 2)
+        # Check new fields in JSON
+        self.assertEqual(data["results"][0]["host_key_type"], "ssh-ed25519")
+        self.assertEqual(data["results"][0]["os_info"], "Ubuntu Linux")
+        self.assertEqual(data["results"][0]["severity"], "high")
 
     def test_save_csv_output(self):
         """Test saving results in CSV format."""
@@ -388,6 +832,10 @@ class TestSSHAuditClientOutput(unittest.TestCase):
         # Header + 2 data rows
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0][0], "host")
+        # Check new columns exist
+        self.assertIn("host_key_type", rows[0])
+        self.assertIn("os_info", rows[0])
+        self.assertIn("severity", rows[0])
 
     def test_save_text_output(self):
         """Test saving results in text format."""
@@ -402,6 +850,205 @@ class TestSSHAuditClientOutput(unittest.TestCase):
         self.assertIn("SSH Security Audit Results", content)
         self.assertIn("SUCCESSFUL LOGINS", content)
         self.assertIn("192.168.1.1", content)
+        self.assertIn("Severity: HIGH", content)
+        self.assertIn("Ubuntu Linux", content)
+
+    def test_save_xml_output(self):
+        """Test saving results in XML format."""
+        import xml.etree.ElementTree as ET
+        output_file = os.path.join(self.temp_dir, "results.xml")
+        self.client.output_file = output_file
+        self.client.output_format = "xml"
+        self.client._save_results()
+
+        tree = ET.parse(output_file)
+        root = tree.getroot()
+        self.assertEqual(root.tag, "sshcheck_scan")
+        self.assertEqual(root.get("version"), __version__)
+
+        results = root.find("results")
+        self.assertEqual(len(results.findall("result")), 2)
+
+        first_result = results.findall("result")[0]
+        self.assertEqual(first_result.find("host").text, "192.168.1.1")
+        self.assertEqual(first_result.find("host_key_type").text, "ssh-ed25519")
+        self.assertEqual(first_result.find("os_info").text, "Ubuntu Linux")
+        self.assertEqual(first_result.find("severity").text, "high")
+
+    def test_save_html_output(self):
+        """Test saving results in HTML format."""
+        output_file = os.path.join(self.temp_dir, "results.html")
+        self.client.output_file = output_file
+        self.client.output_format = "html"
+        self.client._save_results()
+
+        with open(output_file, 'r') as f:
+            content = f.read()
+
+        self.assertIn("<!DOCTYPE html>", content)
+        self.assertIn("SSH Security Audit Report", content)
+        self.assertIn("192.168.1.1", content)
+        self.assertIn("Ubuntu Linux", content)
+        self.assertIn("ssh-ed25519", content)
+        self.assertIn("high", content.lower())
+
+
+class TestCheckpointResume(unittest.TestCase):
+    """Test cases for checkpoint/resume functionality."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_save_checkpoint(self):
+        """Test saving checkpoint data."""
+        checkpoint_file = os.path.join(self.temp_dir, "checkpoint.json")
+        client = SSHAuditClient(checkpoint_file=checkpoint_file)
+        client.results = [
+            ScanResult(
+                host="192.168.1.1", port=22, username="root",
+                password="pass", success=False,
+                timestamp="2026-01-01T12:00:00",
+                error_message="Auth failed"
+            )
+        ]
+        client.stats.total_attempts = 1
+        client.stats.failed_logins = 1
+
+        completed = [("192.168.1.1", 22, "root", "pass")]
+        client._save_checkpoint(completed)
+
+        self.assertTrue(os.path.exists(checkpoint_file))
+        with open(checkpoint_file, 'r') as f:
+            data = json.load(f)
+        self.assertEqual(len(data["completed"]), 1)
+        self.assertEqual(len(data["results"]), 1)
+        self.assertEqual(data["stats"]["total_attempts"], 1)
+
+    def test_load_checkpoint(self):
+        """Test loading checkpoint data."""
+        checkpoint_file = os.path.join(self.temp_dir, "checkpoint.json")
+        data = {
+            "version": __version__,
+            "timestamp": "2026-01-01T12:00:00",
+            "completed": [["192.168.1.1", 22, "root", "pass"]],
+            "results": [],
+            "stats": {"total_attempts": 1, "failed_logins": 1}
+        }
+        with open(checkpoint_file, 'w') as f:
+            json.dump(data, f)
+
+        client = SSHAuditClient(checkpoint_file=checkpoint_file)
+        loaded = client._load_checkpoint()
+        self.assertIsNotNone(loaded)
+        self.assertEqual(len(loaded["completed"]), 1)
+
+    def test_load_nonexistent_checkpoint(self):
+        """Test loading non-existent checkpoint returns None."""
+        client = SSHAuditClient(
+            checkpoint_file=os.path.join(self.temp_dir, "missing.json")
+        )
+        loaded = client._load_checkpoint()
+        self.assertIsNone(loaded)
+
+    def test_load_no_checkpoint_file(self):
+        """Test loading when no checkpoint file is set."""
+        client = SSHAuditClient()
+        loaded = client._load_checkpoint()
+        self.assertIsNone(loaded)
+
+
+class TestConfigFile(unittest.TestCase):
+    """Test cases for configuration file support."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_load_json_config(self):
+        """Test loading JSON config file."""
+        config_file = os.path.join(self.temp_dir, "config.json")
+        config = {
+            "targets": ["192.168.1.1"],
+            "users": ["root"],
+            "passwords": ["pass"],
+            "threads": 5,
+            "timeout": 15,
+            "try_empty": True,
+        }
+        with open(config_file, 'w') as f:
+            json.dump(config, f)
+
+        loaded = load_config_file(config_file)
+        self.assertEqual(loaded["targets"], ["192.168.1.1"])
+        self.assertEqual(loaded["threads"], 5)
+        self.assertTrue(loaded["try_empty"])
+
+    def test_apply_config_to_args(self):
+        """Test applying config values to argparse namespace."""
+        import argparse
+        args = argparse.Namespace(
+            targets=None, target_file=None, users=None, user_file=None,
+            passwords=None, password_file=None, ports=None, port_file=None,
+            output=None, format='text', verbose=False, quiet=False,
+            threads=1, timeout=10, try_empty=False, user_as_pass=False,
+            stop_on_success=False, max_attempts_per_user=0, command=None,
+            checkpoint=None
+        )
+        config = {
+            "targets": ["192.168.1.0/24"],
+            "users": ["root", "admin"],
+            "passwords": ["pass1", "pass2"],
+            "threads": 10,
+            "try_empty": True,
+        }
+        apply_config(args, config)
+        self.assertEqual(args.targets, ["192.168.1.0/24"])
+        self.assertEqual(args.users, ["root", "admin"])
+        self.assertEqual(args.threads, 10)
+        self.assertTrue(args.try_empty)
+
+    def test_cli_overrides_config(self):
+        """Test that CLI arguments override config file."""
+        import argparse
+        args = argparse.Namespace(
+            targets=["10.0.0.1"], target_file=None, users=["testuser"],
+            user_file=None, passwords=["testpass"], password_file=None,
+            ports=None, port_file=None, output=None, format='text',
+            verbose=False, quiet=False, threads=1, timeout=10,
+            try_empty=False, user_as_pass=False, stop_on_success=False,
+            max_attempts_per_user=0, command=None, checkpoint=None
+        )
+        config = {
+            "targets": ["192.168.1.0/24"],
+            "users": ["root"],
+            "threads": 10,
+        }
+        apply_config(args, config)
+        # CLI values should be preserved
+        self.assertEqual(args.targets, ["10.0.0.1"])
+        self.assertEqual(args.users, ["testuser"])
+
+    def test_config_string_to_list(self):
+        """Test that single string values are converted to lists."""
+        import argparse
+        args = argparse.Namespace(
+            targets=None, target_file=None, users=None, user_file=None,
+            passwords=None, password_file=None, ports=None, port_file=None,
+            output=None, format='text', verbose=False, quiet=False,
+            threads=1, timeout=10, try_empty=False, user_as_pass=False,
+            stop_on_success=False, max_attempts_per_user=0, command=None,
+            checkpoint=None
+        )
+        config = {"targets": "192.168.1.1"}
+        apply_config(args, config)
+        self.assertEqual(args.targets, ["192.168.1.1"])
 
 
 class TestArgumentParsing(unittest.TestCase):
@@ -476,12 +1123,82 @@ class TestArgumentParsing(unittest.TestCase):
         self.assertEqual(args.output, 'results.json')
         self.assertEqual(args.format, 'json')
 
+    def test_xml_format(self):
+        """Test parsing XML output format."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '-f', 'xml']):
+            args = parse_arguments()
+        self.assertEqual(args.format, 'xml')
+
+    def test_html_format(self):
+        """Test parsing HTML output format."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '-f', 'html']):
+            args = parse_arguments()
+        self.assertEqual(args.format, 'html')
+
     def test_verbose_flag(self):
         """Test parsing verbose flag."""
         with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
                                 '-p', 'pass', '-v']):
             args = parse_arguments()
         self.assertTrue(args.verbose)
+
+    def test_try_empty_flag(self):
+        """Test parsing --try-empty flag."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--try-empty']):
+            args = parse_arguments()
+        self.assertTrue(args.try_empty)
+
+    def test_user_as_pass_flag(self):
+        """Test parsing --user-as-pass flag."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--user-as-pass']):
+            args = parse_arguments()
+        self.assertTrue(args.user_as_pass)
+
+    def test_stop_on_success_flag(self):
+        """Test parsing --stop-on-success flag."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--stop-on-success']):
+            args = parse_arguments()
+        self.assertTrue(args.stop_on_success)
+
+    def test_max_attempts_per_user(self):
+        """Test parsing --max-attempts-per-user."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--max-attempts-per-user', '3']):
+            args = parse_arguments()
+        self.assertEqual(args.max_attempts_per_user, 3)
+
+    def test_command_option(self):
+        """Test parsing -c/--command option."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '-c', 'id; uname -a']):
+            args = parse_arguments()
+        self.assertEqual(args.command, 'id; uname -a')
+
+    def test_checkpoint_option(self):
+        """Test parsing --checkpoint option."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--checkpoint', 'scan.checkpoint']):
+            args = parse_arguments()
+        self.assertEqual(args.checkpoint, 'scan.checkpoint')
+
+    def test_resume_option(self):
+        """Test parsing --resume option."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--resume', 'scan.checkpoint']):
+            args = parse_arguments()
+        self.assertEqual(args.resume, 'scan.checkpoint')
+
+    def test_config_option(self):
+        """Test parsing --config option."""
+        with patch('sys.argv', ['sshcheck', '--config', 'scan.yaml',
+                                '-t', '192.168.1.1', '-u', 'root', '-p', 'pass']):
+            args = parse_arguments()
+        self.assertEqual(args.config, 'scan.yaml')
 
     def test_default_values(self):
         """Test default argument values."""
@@ -491,6 +1208,12 @@ class TestArgumentParsing(unittest.TestCase):
         self.assertEqual(args.threads, 1)
         self.assertEqual(args.format, 'text')
         self.assertFalse(args.verbose)
+        self.assertFalse(args.try_empty)
+        self.assertFalse(args.user_as_pass)
+        self.assertFalse(args.stop_on_success)
+        self.assertEqual(args.max_attempts_per_user, 0)
+        self.assertIsNone(args.command)
+        self.assertIsNone(args.config)
         self.assertIsNone(args.ports)
 
 
@@ -568,6 +1291,97 @@ class TestIntegration(unittest.TestCase):
         ports_tried = {r.port for r in results}
         self.assertEqual(ports_tried, {22, 2222, 22222})
 
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_scan_with_try_empty(self, mock_ssh_class):
+        """Test scan with --try-empty adds empty password attempts."""
+        mock_client = MagicMock()
+        mock_ssh_class.return_value = mock_client
+        mock_client.connect.side_effect = Exception("Connection failed")
+
+        client = SSHAuditClient(try_empty=True)
+
+        with patch.object(client, '_get_ssh_banner', return_value=""):
+            with patch('sys.stdout', new_callable=StringIO):
+                results = client.scan(
+                    ["192.168.1.1"],
+                    ["root"],
+                    ["password"],
+                    [22]
+                )
+
+        # 1 host * 1 user * 2 passwords (empty + "password") = 2 attempts
+        self.assertEqual(len(results), 2)
+        passwords_tried = {r.password for r in results}
+        self.assertIn("", passwords_tried)
+        self.assertIn("password", passwords_tried)
+
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_scan_with_user_as_pass(self, mock_ssh_class):
+        """Test scan with --user-as-pass adds username as password."""
+        mock_client = MagicMock()
+        mock_ssh_class.return_value = mock_client
+        mock_client.connect.side_effect = Exception("Connection failed")
+
+        client = SSHAuditClient(user_as_pass=True)
+
+        with patch.object(client, '_get_ssh_banner', return_value=""):
+            with patch('sys.stdout', new_callable=StringIO):
+                results = client.scan(
+                    ["192.168.1.1"],
+                    ["admin"],
+                    ["password"],
+                    [22]
+                )
+
+        # 1 host * 1 user * 2 passwords ("admin" + "password") = 2 attempts
+        self.assertEqual(len(results), 2)
+        passwords_tried = {r.password for r in results}
+        self.assertIn("admin", passwords_tried)
+        self.assertIn("password", passwords_tried)
+
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_scan_only_try_empty_no_passwords(self, mock_ssh_class):
+        """Test scan with only --try-empty and no explicit passwords."""
+        mock_client = MagicMock()
+        mock_ssh_class.return_value = mock_client
+        mock_client.connect.side_effect = Exception("Connection failed")
+
+        client = SSHAuditClient(try_empty=True)
+
+        with patch.object(client, '_get_ssh_banner', return_value=""):
+            with patch('sys.stdout', new_callable=StringIO):
+                results = client.scan(
+                    ["192.168.1.1"],
+                    ["root"],
+                    [],  # No explicit passwords
+                    [22]
+                )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].password, "")
+
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_scan_with_checkpoint(self, mock_ssh_class):
+        """Test scan with checkpoint saving."""
+        mock_client = MagicMock()
+        mock_ssh_class.return_value = mock_client
+        mock_client.connect.side_effect = Exception("Connection failed")
+
+        checkpoint_file = os.path.join(self.temp_dir, "scan.checkpoint")
+        client = SSHAuditClient(checkpoint_file=checkpoint_file)
+
+        with patch.object(client, '_get_ssh_banner', return_value=""):
+            with patch('sys.stdout', new_callable=StringIO):
+                results = client.scan(
+                    ["192.168.1.1"],
+                    ["root"],
+                    ["pass"],
+                    [22]
+                )
+
+        # Checkpoint should be saved
+        self.assertTrue(os.path.exists(checkpoint_file))
+
 
 class TestEdgeCases(unittest.TestCase):
     """Test edge cases and error handling."""
@@ -607,6 +1421,18 @@ class TestEdgeCases(unittest.TestCase):
         targets = list(self.client._parse_targets(["192.168.0.0/24"]))
         # /24 gives 254 usable hosts
         self.assertEqual(len(targets), 254)
+
+    def test_quiet_mode_suppresses_progress(self):
+        """Test that quiet mode suppresses progress output."""
+        client = SSHAuditClient(quiet=True)
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="pass", success=False, timestamp="2026-01-01T12:00:00"
+        )
+        # Should not raise or print anything
+        with patch('sys.stdout', new_callable=StringIO) as mock_out:
+            client._print_progress(result, 1, 10)
+        self.assertEqual(mock_out.getvalue(), "")
 
 
 if __name__ == '__main__':

@@ -1,0 +1,21 @@
+# Example credential combo file for sshcheck
+# Format: username:password (one pair per line)
+# Lines starting with # are comments and will be ignored
+# Passwords containing colons are supported (split on first colon only)
+
+# Common default credentials
+root:password
+root:toor
+root:root
+admin:admin
+admin:password
+admin:admin123
+user:user
+user:password
+test:test
+guest:guest
+
+# Service accounts
+oracle:oracle
+mysql:mysql
+postgres:postgres

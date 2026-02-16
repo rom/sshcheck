@@ -6,6 +6,7 @@ These tests verify the functionality of the SSH audit client without
 requiring actual SSH connections (uses mocking for network operations).
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -26,6 +27,7 @@ from sshcheck import (
     VULNERABLE_VERSIONS,
     WEAK_ALGORITHMS,
     OS_FINGERPRINTS,
+    HONEYPOT_SIGNATURES,
     parse_arguments,
     load_config_file,
     apply_config,
@@ -1432,6 +1434,963 @@ class TestEdgeCases(unittest.TestCase):
         # Should not raise or print anything
         with patch('sys.stdout', new_callable=StringIO) as mock_out:
             client._print_progress(result, 1, 10)
+        self.assertEqual(mock_out.getvalue(), "")
+
+
+class TestSprayMode(unittest.TestCase):
+    """Test cases for credential spray mode."""
+
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_spray_mode_order(self, mock_ssh_class):
+        """Test that spray mode tries one password across all users/hosts first."""
+        mock_client = MagicMock()
+        mock_ssh_class.return_value = mock_client
+        mock_client.connect.side_effect = Exception("Connection failed")
+
+        client = SSHAuditClient(spray_mode=True)
+
+        with patch.object(client, '_get_ssh_banner', return_value=""):
+            with patch('sys.stdout', new_callable=StringIO):
+                results = client.scan(
+                    ["192.168.1.1", "192.168.1.2"],
+                    ["root", "admin"],
+                    ["pass1", "pass2"],
+                    [22]
+                )
+
+        # Should have 2 hosts * 2 users * 2 passwords = 8 attempts
+        self.assertEqual(len(results), 8)
+
+        # In spray mode, first 4 attempts should all use the same password
+        # (user_as_pass adds 'root' and 'admin' as first passwords for each user)
+        # Without user_as_pass, first 4 should be pass1
+        first_four_passwords = [r.password for r in results[:4]]
+        # In spray mode the first password round goes across all hosts/users
+        # All attempts in a round should have the same password
+        self.assertEqual(len(set(first_four_passwords)), 1)
+
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_spray_mode_disabled_by_default(self, mock_ssh_class):
+        """Test that spray mode is disabled by default."""
+        client = SSHAuditClient()
+        self.assertFalse(client.spray_mode)
+
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_spray_vs_normal_mode_same_count(self, mock_ssh_class):
+        """Test that spray and normal mode produce same number of attempts."""
+        mock_client = MagicMock()
+        mock_ssh_class.return_value = mock_client
+        mock_client.connect.side_effect = Exception("Failed")
+
+        # Normal mode
+        normal_client = SSHAuditClient()
+        with patch.object(normal_client, '_get_ssh_banner', return_value=""):
+            with patch('sys.stdout', new_callable=StringIO):
+                normal_results = normal_client.scan(
+                    ["192.168.1.1"], ["root", "admin"], ["pass1", "pass2"], [22]
+                )
+
+        # Spray mode
+        spray_client = SSHAuditClient(spray_mode=True)
+        with patch.object(spray_client, '_get_ssh_banner', return_value=""):
+            with patch('sys.stdout', new_callable=StringIO):
+                spray_results = spray_client.scan(
+                    ["192.168.1.1"], ["root", "admin"], ["pass1", "pass2"], [22]
+                )
+
+        self.assertEqual(len(normal_results), len(spray_results))
+
+    def test_spray_mode_argument_parsing(self):
+        """Test parsing --spray flag."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--spray']):
+            args = parse_arguments()
+        self.assertTrue(args.spray)
+
+    def test_spray_mode_default_false(self):
+        """Test --spray defaults to False."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root', '-p', 'pass']):
+            args = parse_arguments()
+        self.assertFalse(args.spray)
+
+
+class TestTargetExclusion(unittest.TestCase):
+    """Test cases for target exclusion functionality."""
+
+    def test_exclude_single_host(self):
+        """Test excluding a single host."""
+        client = SSHAuditClient(exclude_hosts=["192.168.1.5"])
+        self.assertTrue(client._is_excluded("192.168.1.5"))
+        self.assertFalse(client._is_excluded("192.168.1.6"))
+
+    def test_exclude_cidr_range(self):
+        """Test excluding a CIDR range."""
+        client = SSHAuditClient(exclude_hosts=["192.168.1.0/30"])
+        self.assertTrue(client._is_excluded("192.168.1.1"))
+        self.assertTrue(client._is_excluded("192.168.1.2"))
+        self.assertFalse(client._is_excluded("192.168.1.5"))
+
+    def test_exclude_ip_range(self):
+        """Test excluding an IP range."""
+        client = SSHAuditClient(exclude_hosts=["192.168.1.1-3"])
+        self.assertTrue(client._is_excluded("192.168.1.1"))
+        self.assertTrue(client._is_excluded("192.168.1.2"))
+        self.assertTrue(client._is_excluded("192.168.1.3"))
+        self.assertFalse(client._is_excluded("192.168.1.4"))
+
+    def test_exclude_multiple_hosts(self):
+        """Test excluding multiple individual hosts."""
+        client = SSHAuditClient(exclude_hosts=["192.168.1.1", "192.168.1.5", "10.0.0.1"])
+        self.assertTrue(client._is_excluded("192.168.1.1"))
+        self.assertTrue(client._is_excluded("192.168.1.5"))
+        self.assertTrue(client._is_excluded("10.0.0.1"))
+        self.assertFalse(client._is_excluded("192.168.1.2"))
+
+    def test_no_exclusions(self):
+        """Test with no exclusions configured."""
+        client = SSHAuditClient()
+        self.assertFalse(client._is_excluded("192.168.1.1"))
+
+    @patch('sshcheck.paramiko.SSHClient')
+    def test_excluded_hosts_not_scanned(self, mock_ssh_class):
+        """Test that excluded hosts are actually skipped during scan."""
+        mock_client = MagicMock()
+        mock_ssh_class.return_value = mock_client
+        mock_client.connect.side_effect = Exception("Failed")
+
+        client = SSHAuditClient(exclude_hosts=["192.168.1.2"])
+
+        with patch.object(client, '_get_ssh_banner', return_value=""):
+            with patch('sys.stdout', new_callable=StringIO):
+                results = client.scan(
+                    ["192.168.1.1", "192.168.1.2", "192.168.1.3"],
+                    ["root"], ["pass"], [22]
+                )
+
+        # Only 2 hosts should be scanned (1.2 excluded)
+        scanned_hosts = {r.host for r in results}
+        self.assertNotIn("192.168.1.2", scanned_hosts)
+        self.assertIn("192.168.1.1", scanned_hosts)
+        self.assertIn("192.168.1.3", scanned_hosts)
+        self.assertEqual(len(results), 2)
+
+    def test_exclude_argument_parsing(self):
+        """Test parsing --exclude arguments."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.0/24', '-u', 'root',
+                                '-p', 'pass', '--exclude', '192.168.1.1',
+                                '--exclude', '192.168.1.254']):
+            args = parse_arguments()
+        self.assertEqual(args.exclude_hosts, ['192.168.1.1', '192.168.1.254'])
+
+    def test_exclude_file_argument_parsing(self):
+        """Test parsing --exclude-file argument."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.0/24', '-u', 'root',
+                                '-p', 'pass', '--exclude-file', 'exclude.txt']):
+            args = parse_arguments()
+        self.assertEqual(args.exclude_file, 'exclude.txt')
+
+
+class TestHoneypotDetection(unittest.TestCase):
+    """Test cases for honeypot detection."""
+
+    def setUp(self):
+        self.client = SSHAuditClient(detect_honeypot=True)
+
+    def test_known_honeypot_banner(self):
+        """Test detection of known Cowrie honeypot banner."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="root", success=True,
+            timestamp="2026-01-01T12:00:00",
+            banner="SSH-2.0-libssh-0.6.0"
+        )
+        score, reasons = self.client._detect_honeypot_indicators(result)
+        self.assertGreater(score, 0.3)
+        self.assertTrue(any("honeypot banner" in r.lower() for r in reasons))
+
+    def test_suspicious_banner_pattern(self):
+        """Test detection of suspicious banner pattern."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="root", success=True,
+            timestamp="2026-01-01T12:00:00",
+            banner="SSH-2.0-libssh-0.5.3"
+        )
+        score, reasons = self.client._detect_honeypot_indicators(result)
+        self.assertGreater(score, 0.0)
+
+    def test_suspicious_output_pattern(self):
+        """Test detection of known honeypot output."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="root", success=True,
+            timestamp="2026-01-01T12:00:00",
+            banner="SSH-2.0-OpenSSH_8.0",
+            initial_output="root@svr04:~# "
+        )
+        score, reasons = self.client._detect_honeypot_indicators(result)
+        self.assertGreater(score, 0.0)
+        self.assertTrue(any("output pattern" in r.lower() for r in reasons))
+
+    def test_root_trivial_password(self):
+        """Test honeypot score increase for root with trivial password."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="", success=True,
+            timestamp="2026-01-01T12:00:00",
+            banner="SSH-2.0-OpenSSH_8.0"
+        )
+        score, reasons = self.client._detect_honeypot_indicators(result)
+        self.assertGreater(score, 0.0)
+        self.assertTrue(any("trivial password" in r.lower() for r in reasons))
+
+    def test_no_honeypot_indicators(self):
+        """Test normal host with no honeypot indicators."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="admin",
+            password="s3cur3P@ss!", success=True,
+            timestamp="2026-01-01T12:00:00",
+            banner="SSH-2.0-OpenSSH_9.0p1 Ubuntu-1",
+            connection_time=0.5
+        )
+        score, reasons = self.client._detect_honeypot_indicators(result)
+        self.assertEqual(score, 0.0)
+        self.assertEqual(len(reasons), 0)
+
+    def test_failed_login_no_honeypot_check(self):
+        """Test that failed logins get minimal honeypot score."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="wrong", success=False,
+            timestamp="2026-01-01T12:00:00",
+            banner="SSH-2.0-OpenSSH_9.0"
+        )
+        score, reasons = self.client._detect_honeypot_indicators(result)
+        # Failed login should not trigger root+trivial password check
+        self.assertEqual(score, 0.0)
+
+    def test_high_honeypot_score_multiple_indicators(self):
+        """Test high score when multiple indicators present."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="root", success=True,
+            timestamp="2026-01-01T12:00:00",
+            banner="SSH-2.0-libssh-0.6.0",
+            initial_output="root@svr04:~# ",
+            connection_time=0.01
+        )
+        score, reasons = self.client._detect_honeypot_indicators(result)
+        self.assertGreaterEqual(score, 0.7)
+        self.assertGreater(len(reasons), 2)
+
+    def test_honeypot_score_capped_at_one(self):
+        """Test that honeypot score is capped at 1.0."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="", success=True,
+            timestamp="2026-01-01T12:00:00",
+            banner="SSH-2.0-libssh-0.6.0",
+            initial_output="root@svr04:~# uid=0(root) gid=0(root) groups=0(root)",
+            connection_time=0.01
+        )
+        score, reasons = self.client._detect_honeypot_indicators(result)
+        self.assertLessEqual(score, 1.0)
+
+    def test_detect_honeypot_argument_parsing(self):
+        """Test parsing --detect-honeypot flag."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--detect-honeypot']):
+            args = parse_arguments()
+        self.assertTrue(args.detect_honeypot)
+
+
+class TestNmapXMLImport(unittest.TestCase):
+    """Test cases for Nmap XML import functionality."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_import_basic_nmap_xml(self):
+        """Test importing a basic Nmap XML with SSH hosts."""
+        nmap_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun>
+  <host>
+    <status state="up"/>
+    <address addr="192.168.1.1"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open"/>
+        <service name="ssh"/>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <status state="up"/>
+    <address addr="192.168.1.2"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open"/>
+        <service name="ssh"/>
+      </port>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>"""
+        filepath = os.path.join(self.temp_dir, "scan.xml")
+        with open(filepath, 'w') as f:
+            f.write(nmap_xml)
+
+        targets = SSHAuditClient.import_nmap_xml(filepath)
+        self.assertEqual(len(targets), 2)
+        self.assertIn("192.168.1.1:22", targets)
+        self.assertIn("192.168.1.2:22", targets)
+
+    def test_import_nmap_nonstandard_ssh_port(self):
+        """Test importing Nmap XML with SSH on non-standard port."""
+        nmap_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun>
+  <host>
+    <status state="up"/>
+    <address addr="10.0.0.1"/>
+    <ports>
+      <port protocol="tcp" portid="2222">
+        <state state="open"/>
+        <service name="ssh"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>"""
+        filepath = os.path.join(self.temp_dir, "scan.xml")
+        with open(filepath, 'w') as f:
+            f.write(nmap_xml)
+
+        targets = SSHAuditClient.import_nmap_xml(filepath)
+        self.assertEqual(len(targets), 1)
+        self.assertIn("10.0.0.1:2222", targets)
+
+    def test_import_nmap_no_ssh_hosts(self):
+        """Test importing Nmap XML with no SSH hosts."""
+        nmap_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun>
+  <host>
+    <status state="up"/>
+    <address addr="192.168.1.1"/>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>"""
+        filepath = os.path.join(self.temp_dir, "scan.xml")
+        with open(filepath, 'w') as f:
+            f.write(nmap_xml)
+
+        targets = SSHAuditClient.import_nmap_xml(filepath)
+        self.assertEqual(len(targets), 0)
+
+    def test_import_nmap_closed_ssh_port(self):
+        """Test that closed SSH ports are not imported."""
+        nmap_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun>
+  <host>
+    <status state="up"/>
+    <address addr="192.168.1.1"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="closed"/>
+        <service name="ssh"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>"""
+        filepath = os.path.join(self.temp_dir, "scan.xml")
+        with open(filepath, 'w') as f:
+            f.write(nmap_xml)
+
+        targets = SSHAuditClient.import_nmap_xml(filepath)
+        self.assertEqual(len(targets), 0)
+
+    def test_import_nmap_down_host(self):
+        """Test that down hosts are not imported."""
+        nmap_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun>
+  <host>
+    <status state="down"/>
+    <address addr="192.168.1.1"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open"/>
+        <service name="ssh"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>"""
+        filepath = os.path.join(self.temp_dir, "scan.xml")
+        with open(filepath, 'w') as f:
+            f.write(nmap_xml)
+
+        targets = SSHAuditClient.import_nmap_xml(filepath)
+        self.assertEqual(len(targets), 0)
+
+    def test_import_nmap_file_not_found(self):
+        """Test error on non-existent Nmap file."""
+        with self.assertRaises(FileNotFoundError):
+            SSHAuditClient.import_nmap_xml("/nonexistent/scan.xml")
+
+    def test_import_nmap_invalid_xml(self):
+        """Test error on invalid XML."""
+        filepath = os.path.join(self.temp_dir, "bad.xml")
+        with open(filepath, 'w') as f:
+            f.write("not valid xml <><>")
+
+        with self.assertRaises(ValueError):
+            SSHAuditClient.import_nmap_xml(filepath)
+
+    def test_import_nmap_common_port_without_service(self):
+        """Test that port 22 is detected even without service info."""
+        nmap_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun>
+  <host>
+    <status state="up"/>
+    <address addr="192.168.1.1"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>"""
+        filepath = os.path.join(self.temp_dir, "scan.xml")
+        with open(filepath, 'w') as f:
+            f.write(nmap_xml)
+
+        targets = SSHAuditClient.import_nmap_xml(filepath)
+        self.assertEqual(len(targets), 1)
+        self.assertIn("192.168.1.1:22", targets)
+
+    def test_import_nmap_argument_parsing(self):
+        """Test parsing --import-nmap argument."""
+        with patch('sys.argv', ['sshcheck', '--import-nmap', 'scan.xml',
+                                '-u', 'root', '-p', 'pass']):
+            args = parse_arguments()
+        self.assertEqual(args.import_nmap, 'scan.xml')
+
+
+class TestBaselineComparison(unittest.TestCase):
+    """Test cases for baseline comparison functionality."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _create_baseline(self, results):
+        """Helper to create a baseline file."""
+        filepath = os.path.join(self.temp_dir, "baseline.json")
+        data = {
+            "scan_info": {"version": __version__},
+            "results": results
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f)
+        return filepath
+
+    def test_no_changes(self):
+        """Test baseline comparison with no changes."""
+        baseline = self._create_baseline([
+            {"host": "192.168.1.1", "port": 22, "username": "root",
+             "password": "pass", "success": True,
+             "host_key_fingerprint": "SHA256:abc", "host_key_type": "ssh-ed25519",
+             "ssh_version": "OpenSSH_9.0"}
+        ])
+        current = [ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="pass", success=True,
+            timestamp="2026-01-01T12:00:00",
+            host_key_fingerprint="SHA256:abc", host_key_type="ssh-ed25519",
+            ssh_version="OpenSSH_9.0"
+        )]
+        diff = SSHAuditClient.compare_baseline(current, baseline)
+        self.assertEqual(diff['summary']['new_hosts_count'], 0)
+        self.assertEqual(diff['summary']['removed_hosts_count'], 0)
+        self.assertEqual(diff['summary']['new_credentials_count'], 0)
+        self.assertEqual(diff['summary']['host_key_changes_count'], 0)
+
+    def test_new_host_detected(self):
+        """Test detecting a new host."""
+        baseline = self._create_baseline([
+            {"host": "192.168.1.1", "port": 22, "username": "root",
+             "password": "pass", "success": False}
+        ])
+        current = [
+            ScanResult(host="192.168.1.1", port=22, username="root",
+                       password="pass", success=False, timestamp="2026-01-01T12:00:00"),
+            ScanResult(host="192.168.1.2", port=22, username="root",
+                       password="pass", success=False, timestamp="2026-01-01T12:00:01"),
+        ]
+        diff = SSHAuditClient.compare_baseline(current, baseline)
+        self.assertEqual(diff['summary']['new_hosts_count'], 1)
+        self.assertEqual(diff['new_hosts'][0]['host'], "192.168.1.2")
+
+    def test_removed_host_detected(self):
+        """Test detecting a removed host."""
+        baseline = self._create_baseline([
+            {"host": "192.168.1.1", "port": 22, "username": "root",
+             "password": "pass", "success": False},
+            {"host": "192.168.1.2", "port": 22, "username": "root",
+             "password": "pass", "success": False},
+        ])
+        current = [
+            ScanResult(host="192.168.1.1", port=22, username="root",
+                       password="pass", success=False, timestamp="2026-01-01T12:00:00"),
+        ]
+        diff = SSHAuditClient.compare_baseline(current, baseline)
+        self.assertEqual(diff['summary']['removed_hosts_count'], 1)
+        self.assertEqual(diff['removed_hosts'][0]['host'], "192.168.1.2")
+
+    def test_new_credential_detected(self):
+        """Test detecting new valid credentials."""
+        baseline = self._create_baseline([
+            {"host": "192.168.1.1", "port": 22, "username": "root",
+             "password": "pass", "success": False}
+        ])
+        current = [
+            ScanResult(host="192.168.1.1", port=22, username="root",
+                       password="pass", success=True, timestamp="2026-01-01T12:00:00"),
+        ]
+        diff = SSHAuditClient.compare_baseline(current, baseline)
+        self.assertEqual(diff['summary']['new_credentials_count'], 1)
+
+    def test_lost_credential_detected(self):
+        """Test detecting credentials that stopped working."""
+        baseline = self._create_baseline([
+            {"host": "192.168.1.1", "port": 22, "username": "root",
+             "password": "pass", "success": True}
+        ])
+        current = [
+            ScanResult(host="192.168.1.1", port=22, username="root",
+                       password="pass", success=False, timestamp="2026-01-01T12:00:00"),
+        ]
+        diff = SSHAuditClient.compare_baseline(current, baseline)
+        self.assertEqual(diff['summary']['lost_credentials_count'], 1)
+
+    def test_host_key_change_detected(self):
+        """Test detecting host key changes."""
+        baseline = self._create_baseline([
+            {"host": "192.168.1.1", "port": 22, "username": "root",
+             "password": "pass", "success": True,
+             "host_key_fingerprint": "SHA256:old_key",
+             "host_key_type": "ssh-ed25519"}
+        ])
+        current = [
+            ScanResult(host="192.168.1.1", port=22, username="root",
+                       password="pass", success=True,
+                       timestamp="2026-01-01T12:00:00",
+                       host_key_fingerprint="SHA256:new_key",
+                       host_key_type="ssh-ed25519"),
+        ]
+        diff = SSHAuditClient.compare_baseline(current, baseline)
+        self.assertEqual(diff['summary']['host_key_changes_count'], 1)
+        self.assertEqual(diff['host_key_changes'][0]['previous_fingerprint'], "SHA256:old_key")
+        self.assertEqual(diff['host_key_changes'][0]['current_fingerprint'], "SHA256:new_key")
+
+    def test_ssh_version_change_detected(self):
+        """Test detecting SSH version changes."""
+        baseline = self._create_baseline([
+            {"host": "192.168.1.1", "port": 22, "username": "root",
+             "password": "pass", "success": False,
+             "ssh_version": "OpenSSH_7.9"}
+        ])
+        current = [
+            ScanResult(host="192.168.1.1", port=22, username="root",
+                       password="pass", success=False,
+                       timestamp="2026-01-01T12:00:00",
+                       ssh_version="OpenSSH_9.0"),
+        ]
+        diff = SSHAuditClient.compare_baseline(current, baseline)
+        self.assertEqual(diff['summary']['ssh_version_changes_count'], 1)
+        self.assertEqual(diff['ssh_version_changes'][0]['previous_version'], "OpenSSH_7.9")
+        self.assertEqual(diff['ssh_version_changes'][0]['current_version'], "OpenSSH_9.0")
+
+    def test_baseline_file_not_found(self):
+        """Test error on non-existent baseline file."""
+        current = [ScanResult(host="192.168.1.1", port=22, username="root",
+                              password="pass", success=False, timestamp="now")]
+        with self.assertRaises(FileNotFoundError):
+            SSHAuditClient.compare_baseline(current, "/nonexistent/baseline.json")
+
+    def test_baseline_invalid_json(self):
+        """Test error on invalid JSON baseline."""
+        filepath = os.path.join(self.temp_dir, "bad.json")
+        with open(filepath, 'w') as f:
+            f.write("not json{{}}")
+
+        current = [ScanResult(host="192.168.1.1", port=22, username="root",
+                              password="pass", success=False, timestamp="now")]
+        with self.assertRaises(ValueError):
+            SSHAuditClient.compare_baseline(current, filepath)
+
+    def test_baseline_argument_parsing(self):
+        """Test parsing --baseline argument."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--baseline', 'prev_scan.json']):
+            args = parse_arguments()
+        self.assertEqual(args.baseline, 'prev_scan.json')
+
+
+class TestHostKeyContinuity(unittest.TestCase):
+    """Test cases for host key continuity checking."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_load_json_known_hosts(self):
+        """Test loading known hosts from JSON format."""
+        filepath = os.path.join(self.temp_dir, "known_hosts.json")
+        data = {
+            "192.168.1.1:22": {
+                "type": "ssh-ed25519",
+                "fingerprint": "SHA256:abc123"
+            },
+            "10.0.0.1:2222": {
+                "type": "ssh-rsa",
+                "fingerprint": "SHA256:def456"
+            }
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f)
+
+        client = SSHAuditClient(known_hosts_file=filepath)
+        self.assertEqual(len(client._known_host_keys), 2)
+        self.assertEqual(client._known_host_keys["192.168.1.1:22"][1], "SHA256:abc123")
+        self.assertEqual(client._known_host_keys["10.0.0.1:2222"][0], "ssh-rsa")
+
+    def test_load_openssh_known_hosts(self):
+        """Test loading known hosts from OpenSSH format."""
+        import base64
+        # Create a fake key and compute its expected fingerprint
+        fake_key_bytes = b"fake_ssh_key_data_for_testing_1234"
+        key_b64 = base64.b64encode(fake_key_bytes).decode()
+        expected_fp = hashlib.sha256(fake_key_bytes).hexdigest()
+        expected_fp_formatted = ':'.join(
+            expected_fp[i:i+2] for i in range(0, len(expected_fp), 2)
+        )
+
+        filepath = os.path.join(self.temp_dir, "known_hosts")
+        with open(filepath, 'w') as f:
+            f.write(f"# Comment line\n")
+            f.write(f"192.168.1.1 ssh-ed25519 {key_b64}\n")
+            f.write(f"10.0.0.1 ssh-rsa {key_b64}\n")
+
+        client = SSHAuditClient(known_hosts_file=filepath)
+        self.assertGreater(len(client._known_host_keys), 0)
+        # Check that host was loaded with default port 22
+        self.assertIn("192.168.1.1:22", client._known_host_keys)
+
+    def test_host_key_no_change(self):
+        """Test host key continuity check when key hasn't changed."""
+        filepath = os.path.join(self.temp_dir, "known_hosts.json")
+        data = {
+            "192.168.1.1:22": {
+                "type": "ssh-ed25519",
+                "fingerprint": "SHA256:abc123"
+            }
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f)
+
+        client = SSHAuditClient(known_hosts_file=filepath)
+        changed, prev = client._check_host_key_continuity(
+            "192.168.1.1", 22, "ssh-ed25519", "SHA256:abc123"
+        )
+        self.assertFalse(changed)
+        self.assertEqual(prev, "")
+
+    def test_host_key_changed(self):
+        """Test host key continuity check when key HAS changed (MITM)."""
+        filepath = os.path.join(self.temp_dir, "known_hosts.json")
+        data = {
+            "192.168.1.1:22": {
+                "type": "ssh-ed25519",
+                "fingerprint": "SHA256:old_fingerprint"
+            }
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f)
+
+        client = SSHAuditClient(known_hosts_file=filepath)
+        changed, prev = client._check_host_key_continuity(
+            "192.168.1.1", 22, "ssh-ed25519", "SHA256:new_fingerprint"
+        )
+        self.assertTrue(changed)
+        self.assertEqual(prev, "SHA256:old_fingerprint")
+
+    def test_host_key_unknown_host(self):
+        """Test host key check for unknown host (not in known_hosts)."""
+        filepath = os.path.join(self.temp_dir, "known_hosts.json")
+        data = {
+            "192.168.1.1:22": {
+                "type": "ssh-ed25519",
+                "fingerprint": "SHA256:abc123"
+            }
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f)
+
+        client = SSHAuditClient(known_hosts_file=filepath)
+        changed, prev = client._check_host_key_continuity(
+            "10.0.0.1", 22, "ssh-ed25519", "SHA256:xyz789"
+        )
+        self.assertFalse(changed)
+
+    def test_save_known_hosts(self):
+        """Test saving discovered host keys."""
+        filepath = os.path.join(self.temp_dir, "known_hosts.json")
+        client = SSHAuditClient(known_hosts_file=filepath)
+        client.results = [
+            ScanResult(
+                host="192.168.1.1", port=22, username="root",
+                password="pass", success=True,
+                timestamp="2026-01-01T12:00:00",
+                host_key_type="ssh-ed25519",
+                host_key_fingerprint="SHA256:abc123",
+                host_key_bits=256
+            ),
+            ScanResult(
+                host="10.0.0.1", port=2222, username="admin",
+                password="pass", success=True,
+                timestamp="2026-01-01T12:00:01",
+                host_key_type="ssh-rsa",
+                host_key_fingerprint="SHA256:def456",
+                host_key_bits=4096
+            ),
+        ]
+        client._save_known_hosts(filepath)
+
+        with open(filepath, 'r') as f:
+            saved = json.load(f)
+
+        self.assertIn("192.168.1.1:22", saved)
+        self.assertIn("10.0.0.1:2222", saved)
+        self.assertEqual(saved["192.168.1.1:22"]["type"], "ssh-ed25519")
+        self.assertEqual(saved["10.0.0.1:2222"]["fingerprint"], "SHA256:def456")
+
+    def test_severity_critical_on_key_change(self):
+        """Test that host key change triggers CRITICAL severity."""
+        client = SSHAuditClient()
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="user",
+            password="pass", success=False,
+            timestamp="2026-01-01T12:00:00",
+            host_key_changed=True,
+            host_key_previous="SHA256:old_key"
+        )
+        severity, reasons = client._assess_severity(result)
+        self.assertEqual(severity, "critical")
+        self.assertTrue(any("MITM" in r for r in reasons))
+
+    def test_nonexistent_known_hosts_file(self):
+        """Test graceful handling of non-existent known hosts file."""
+        client = SSHAuditClient(known_hosts_file="/nonexistent/file.json")
+        self.assertEqual(len(client._known_host_keys), 0)
+
+    def test_known_hosts_argument_parsing(self):
+        """Test parsing --known-hosts argument."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root',
+                                '-p', 'pass', '--known-hosts', 'hosts.json']):
+            args = parse_arguments()
+        self.assertEqual(args.known_hosts, 'hosts.json')
+
+
+class TestScanResultNewFields(unittest.TestCase):
+    """Test cases for new ScanResult fields (honeypot, host key change)."""
+
+    def test_scan_result_honeypot_fields(self):
+        """Test ScanResult honeypot fields."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="root", success=True,
+            timestamp="2026-01-01T12:00:00",
+            honeypot_score=0.7,
+            honeypot_reasons=["Known honeypot banner"]
+        )
+        self.assertEqual(result.honeypot_score, 0.7)
+        self.assertEqual(len(result.honeypot_reasons), 1)
+
+    def test_scan_result_host_key_change_fields(self):
+        """Test ScanResult host key change fields."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="pass", success=True,
+            timestamp="2026-01-01T12:00:00",
+            host_key_changed=True,
+            host_key_previous="SHA256:old"
+        )
+        self.assertTrue(result.host_key_changed)
+        self.assertEqual(result.host_key_previous, "SHA256:old")
+
+    def test_scan_result_to_dict_new_fields(self):
+        """Test to_dict includes new fields."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="pass", success=True,
+            timestamp="2026-01-01T12:00:00",
+            honeypot_score=0.5,
+            host_key_changed=True
+        )
+        d = result.to_dict()
+        self.assertIn('honeypot_score', d)
+        self.assertIn('honeypot_reasons', d)
+        self.assertIn('host_key_changed', d)
+        self.assertIn('host_key_previous', d)
+        self.assertEqual(d['honeypot_score'], 0.5)
+        self.assertTrue(d['host_key_changed'])
+        # None honeypot_reasons should be converted to empty list
+        self.assertEqual(d['honeypot_reasons'], [])
+
+    def test_scan_result_defaults(self):
+        """Test default values for new fields."""
+        result = ScanResult(
+            host="192.168.1.1", port=22, username="root",
+            password="pass", success=False,
+            timestamp="2026-01-01T12:00:00"
+        )
+        self.assertEqual(result.honeypot_score, 0.0)
+        self.assertIsNone(result.honeypot_reasons)
+        self.assertFalse(result.host_key_changed)
+        self.assertEqual(result.host_key_previous, "")
+
+
+class TestNewArgumentDefaults(unittest.TestCase):
+    """Test default values for new CLI arguments."""
+
+    def test_all_new_defaults(self):
+        """Test all new argument defaults."""
+        with patch('sys.argv', ['sshcheck', '-t', '192.168.1.1', '-u', 'root', '-p', 'pass']):
+            args = parse_arguments()
+        self.assertFalse(args.spray)
+        self.assertIsNone(args.exclude_hosts)
+        self.assertIsNone(args.exclude_file)
+        self.assertFalse(args.detect_honeypot)
+        self.assertIsNone(args.known_hosts)
+        self.assertIsNone(args.baseline)
+        self.assertIsNone(args.import_nmap)
+
+
+class TestConfigNewOptions(unittest.TestCase):
+    """Test configuration file support for new options."""
+
+    def test_apply_config_spray(self):
+        """Test applying spray mode from config."""
+        import argparse
+        args = argparse.Namespace(
+            targets=None, target_file=None, users=None, user_file=None,
+            passwords=None, password_file=None, ports=None, port_file=None,
+            output=None, format='text', verbose=False, quiet=False,
+            threads=1, timeout=10, try_empty=False, user_as_pass=False,
+            stop_on_success=False, max_attempts_per_user=0, command=None,
+            checkpoint=None, spray=False, exclude_hosts=None,
+            detect_honeypot=False, known_hosts=None, baseline=None,
+            import_nmap=None
+        )
+        config = {
+            "spray": True,
+            "detect_honeypot": True,
+            "known_hosts": "hosts.json",
+            "baseline": "prev_scan.json",
+        }
+        apply_config(args, config)
+        self.assertTrue(args.spray)
+        self.assertTrue(args.detect_honeypot)
+        self.assertEqual(args.known_hosts, "hosts.json")
+        self.assertEqual(args.baseline, "prev_scan.json")
+
+
+class TestBaselineDiffPrinting(unittest.TestCase):
+    """Test baseline diff printing."""
+
+    def test_print_no_changes(self):
+        """Test printing diff with no changes."""
+        client = SSHAuditClient()
+        diff = {
+            'new_hosts': [], 'removed_hosts': [],
+            'new_credentials': [], 'lost_credentials': [],
+            'host_key_changes': [], 'ssh_version_changes': [],
+            'summary': {
+                'new_hosts_count': 0, 'removed_hosts_count': 0,
+                'new_credentials_count': 0, 'lost_credentials_count': 0,
+                'host_key_changes_count': 0, 'ssh_version_changes_count': 0,
+            }
+        }
+        with patch('sys.stdout', new_callable=StringIO) as mock_out:
+            client._print_baseline_diff(diff)
+        self.assertIn("No changes", mock_out.getvalue())
+
+    def test_print_with_changes(self):
+        """Test printing diff with various changes."""
+        client = SSHAuditClient()
+        diff = {
+            'new_hosts': [{'host': '10.0.0.5', 'port': 22}],
+            'removed_hosts': [{'host': '10.0.0.3', 'port': 22}],
+            'new_credentials': [
+                {'host': '10.0.0.1', 'port': 22, 'username': 'root', 'password': 'pass'}
+            ],
+            'lost_credentials': [],
+            'host_key_changes': [{
+                'host': '10.0.0.1', 'port': 22,
+                'previous_type': 'ssh-rsa', 'previous_fingerprint': 'SHA256:old',
+                'current_type': 'ssh-ed25519', 'current_fingerprint': 'SHA256:new'
+            }],
+            'ssh_version_changes': [{
+                'host': '10.0.0.1', 'port': 22,
+                'previous_version': 'OpenSSH_7.0', 'current_version': 'OpenSSH_9.0'
+            }],
+            'summary': {
+                'new_hosts_count': 1, 'removed_hosts_count': 1,
+                'new_credentials_count': 1, 'lost_credentials_count': 0,
+                'host_key_changes_count': 1, 'ssh_version_changes_count': 1,
+            }
+        }
+        with patch('sys.stdout', new_callable=StringIO) as mock_out:
+            client._print_baseline_diff(diff)
+        output = mock_out.getvalue()
+        self.assertIn("NEW HOSTS", output)
+        self.assertIn("REMOVED HOSTS", output)
+        self.assertIn("NEW CREDENTIALS", output)
+        self.assertIn("HOST KEY CHANGES", output)
+        self.assertIn("SSH VERSION CHANGES", output)
+
+    def test_quiet_mode_suppresses_diff(self):
+        """Test that quiet mode suppresses diff output."""
+        client = SSHAuditClient(quiet=True)
+        diff = {
+            'new_hosts': [{'host': '10.0.0.5', 'port': 22}],
+            'removed_hosts': [], 'new_credentials': [],
+            'lost_credentials': [], 'host_key_changes': [],
+            'ssh_version_changes': [],
+            'summary': {
+                'new_hosts_count': 1, 'removed_hosts_count': 0,
+                'new_credentials_count': 0, 'lost_credentials_count': 0,
+                'host_key_changes_count': 0, 'ssh_version_changes_count': 0,
+            }
+        }
+        with patch('sys.stdout', new_callable=StringIO) as mock_out:
+            client._print_baseline_diff(diff)
         self.assertEqual(mock_out.getvalue(), "")
 
 

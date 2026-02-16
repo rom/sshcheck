@@ -6,13 +6,19 @@ A Python-based SSH security audit tool for testing login capabilities across mul
 
 - **Multi-target scanning**: Scan single IPs, CIDR ranges, IP ranges, or hostnames
 - **Credential testing**: Test multiple username/password combinations
+- **Credential spray mode**: Try one password across all users/hosts before the next (avoids lockouts)
 - **Empty/null password testing**: Automatically test blank passwords with `--try-empty`
 - **Username-as-password testing**: Test each username as its own password with `--user-as-pass`
 - **Multi-port support**: Test SSH on non-standard ports
+- **Target exclusion**: Exclude specific hosts, CIDRs, or ranges from scanning
 - **Host key fingerprinting**: Collect and report SSH host key type, fingerprint, and key size
+- **Host key continuity check**: Detect host key changes (possible MITM) against known hosts
 - **Algorithm enumeration**: Detect supported KEX, cipher, MAC, and host key algorithms; flag weak ones
 - **OS/version fingerprinting**: Identify OS and SSH version from server banners
+- **Honeypot detection**: Identify likely SSH honeypots (Cowrie, Kippo) from banners and behavior
 - **Severity scoring**: Automatic risk assessment (critical/high/medium/low/info) based on findings
+- **Baseline comparison**: Compare scan results against previous scans to detect changes
+- **Nmap XML import**: Import targets from Nmap scan results
 - **Command execution**: Run commands on successful login and capture output
 - **Output capture**: Captures SSH banners and initial shell output (welcome messages, prompts)
 - **Multiple output formats**: Text, JSON, CSV, XML, and HTML report output
@@ -110,6 +116,28 @@ pip install pyyaml          # Optional: for YAML config files
 | `-c, --command CMD` | Execute command on successful login and capture output |
 | `--checkpoint FILE` | Save scan progress to checkpoint file |
 | `--resume FILE` | Resume scan from a checkpoint file |
+| `--spray` | Credential spray mode: try one password across all users/hosts before the next |
+
+#### Target Exclusion
+
+| Option | Description |
+|--------|-------------|
+| `--exclude HOST` | Host(s) to exclude from scanning. Accepts same formats as `-t`. Can be specified multiple times. |
+| `--exclude-file FILE` | File containing hosts to exclude (one per line) |
+
+#### Security Features
+
+| Option | Description |
+|--------|-------------|
+| `--detect-honeypot` | Enable honeypot detection (analyzes banners, response patterns for Cowrie, Kippo, etc.) |
+| `--known-hosts FILE` | Check host keys against known hosts file for MITM detection. Supports OpenSSH and JSON formats. Discovered keys are saved back after scanning. |
+| `--baseline FILE` | Compare results against a previous scan baseline (JSON). Reports new/removed hosts, changed credentials, host key changes, SSH version changes. |
+
+#### Nmap Integration
+
+| Option | Description |
+|--------|-------------|
+| `--import-nmap FILE` | Import targets from Nmap XML output. Extracts hosts with open SSH ports. Can be combined with `-t`. |
 
 #### Configuration
 
@@ -194,6 +222,55 @@ pip install pyyaml          # Optional: for YAML config files
 
 ```bash
 ./sshcheck.py -t 192.168.1.1 -u root -p pass -f xml -o results.xml
+```
+
+### Credential spray mode (avoids account lockouts)
+
+```bash
+./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt --spray -n 5
+```
+
+### Scan with host exclusions
+
+```bash
+./sshcheck.py -t 192.168.1.0/24 --exclude 192.168.1.1 --exclude 192.168.1.254 -u root -p pass
+./sshcheck.py -t 10.0.0.0/24 --exclude-file critical_hosts.txt -U users.txt -P passwords.txt
+```
+
+### Import targets from Nmap scan results
+
+```bash
+# First run Nmap to discover SSH hosts
+nmap -p 22,2222 -sV -oX scan.xml 192.168.1.0/24
+
+# Then use sshcheck to audit discovered SSH hosts
+./sshcheck.py --import-nmap scan.xml -U users.txt -P passwords.txt
+```
+
+### Honeypot detection
+
+```bash
+./sshcheck.py -t 192.168.1.1 -u root -p pass --detect-honeypot
+```
+
+### Host key continuity check (MITM detection)
+
+```bash
+# First scan saves host keys
+./sshcheck.py -t 192.168.1.0/24 -u root -p pass --known-hosts known_hosts.json
+
+# Subsequent scans detect host key changes
+./sshcheck.py -t 192.168.1.0/24 -u root -p pass --known-hosts known_hosts.json
+```
+
+### Baseline comparison (detect changes between scans)
+
+```bash
+# Run initial scan and save results
+./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt -o baseline.json -f json
+
+# Later, run again with baseline comparison
+./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt --baseline baseline.json -o current.json -f json
 ```
 
 ## Configuration File
@@ -330,6 +407,66 @@ Styled HTML report with:
 - Host key and OS information
 - Command output display
 - Color-coded severity levels (critical/high/medium/low/info)
+
+## Credential Spray Mode
+
+In normal mode, sshcheck tries all passwords for a given user on a host before moving on. This can trigger account lockouts in enterprise environments.
+
+Spray mode (`--spray`) changes the order: it tries **one password across all users and hosts** before moving to the next password. This mimics real-world attack patterns and dramatically reduces the risk of lockout.
+
+```
+Normal mode:  host1/user1/pass1, host1/user1/pass2, host1/user1/pass3, host1/user2/pass1, ...
+Spray mode:   host1/user1/pass1, host1/user2/pass1, host2/user1/pass1, host2/user2/pass1, ...pass2...
+```
+
+## Honeypot Detection
+
+When `--detect-honeypot` is enabled, sshcheck analyzes each connection for signs of SSH honeypots (Cowrie, Kippo, etc.):
+
+- **Known honeypot banners**: Matches against known Cowrie/Kippo SSH banner signatures
+- **Suspicious banner patterns**: Regex patterns matching common honeypot software
+- **Default honeypot output**: Known default hostnames and shell output patterns
+- **Timing analysis**: Suspiciously fast connections may indicate emulated services
+- **Trivial credential acceptance**: Root login with empty or common passwords
+
+Each result gets a honeypot score (0.0-1.0). Scores >= 0.5 are flagged as likely honeypots.
+
+## Host Key Continuity Check
+
+The `--known-hosts` option detects potential MITM (Man-in-the-Middle) attacks by comparing discovered host keys against previously known keys.
+
+**Supported formats:**
+- **sshcheck JSON format**: `{"host:port": {"type": "ssh-ed25519", "fingerprint": "SHA256:..."}}`
+- **OpenSSH known_hosts format**: Standard `hostname key-type base64-key` format
+
+On first run, discovered keys are **saved to the file**. On subsequent runs, any key changes are flagged as **CRITICAL** severity findings.
+
+## Baseline Comparison
+
+The `--baseline` option compares current scan results against a previous scan to detect changes:
+
+- **New hosts**: Hosts present now but not in baseline
+- **Removed hosts**: Hosts in baseline but not present now
+- **New credentials**: Credentials that work now but didn't before
+- **Lost credentials**: Credentials that stopped working
+- **Host key changes**: SSH host key fingerprint changes
+- **SSH version changes**: Software version upgrades or downgrades
+
+A diff report is printed to stdout and saved as a `.diff.json` file alongside the output file.
+
+## Nmap XML Import
+
+Import targets from Nmap XML output (`-oX`) to scan only hosts with SSH ports open:
+
+```bash
+nmap -p 22,2222,22222 -sV -oX nmap_scan.xml 10.0.0.0/24
+./sshcheck.py --import-nmap nmap_scan.xml -U users.txt -P passwords.txt
+```
+
+Nmap results are filtered for:
+- Hosts in `up` state
+- TCP ports in `open` state
+- Ports with `ssh` service name, or common SSH ports (22, 2222, 22222, 8022)
 
 ## Severity Scoring
 

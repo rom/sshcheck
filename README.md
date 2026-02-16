@@ -6,17 +6,28 @@ A Python-based SSH security audit tool for testing login capabilities across mul
 
 - **Multi-target scanning**: Scan single IPs, CIDR ranges, IP ranges, or hostnames
 - **Credential testing**: Test multiple username/password combinations
+- **Empty/null password testing**: Automatically test blank passwords with `--try-empty`
+- **Username-as-password testing**: Test each username as its own password with `--user-as-pass`
 - **Multi-port support**: Test SSH on non-standard ports
+- **Host key fingerprinting**: Collect and report SSH host key type, fingerprint, and key size
+- **Algorithm enumeration**: Detect supported KEX, cipher, MAC, and host key algorithms; flag weak ones
+- **OS/version fingerprinting**: Identify OS and SSH version from server banners
+- **Severity scoring**: Automatic risk assessment (critical/high/medium/low/info) based on findings
+- **Command execution**: Run commands on successful login and capture output
 - **Output capture**: Captures SSH banners and initial shell output (welcome messages, prompts)
-- **Multiple output formats**: Text, JSON, and CSV output
+- **Multiple output formats**: Text, JSON, CSV, XML, and HTML report output
+- **Configuration files**: YAML or JSON config files for reusable scan profiles
+- **Resume/checkpoint**: Save scan progress and resume interrupted scans
+- **Account lockout protection**: Limit failed attempts per user to avoid lockouts
+- **Stop on first success**: Skip remaining credentials after finding valid login per host
 - **Concurrent scanning**: Multi-threaded execution for faster scans
 - **Comprehensive error handling**: Detailed error messages for troubleshooting
-- **Cross-platform**: Works on various Linux distributions
 
 ## Requirements
 
 - Python 3.6 or later
 - paramiko library
+- pyyaml library (optional, for YAML config files)
 
 ## Installation
 
@@ -37,7 +48,8 @@ chmod +x sshcheck.py
 ### Dependencies
 
 ```bash
-pip install paramiko
+pip install paramiko        # Required
+pip install pyyaml          # Optional: for YAML config files
 ```
 
 ## Usage
@@ -70,6 +82,8 @@ pip install paramiko
 |--------|-------------|
 | `-p, --password PASS` | Password(s) to try. Can be specified multiple times. |
 | `-P, --password-file FILE` | File containing passwords (one per line) |
+| `--try-empty` | Also try empty/null password for each username |
+| `--user-as-pass` | Also try the username as the password for each user |
 
 #### Port Specification
 
@@ -83,9 +97,25 @@ pip install paramiko
 | Option | Description |
 |--------|-------------|
 | `-o, --output FILE` | Save results to specified file |
-| `-f, --format FORMAT` | Output format: `text`, `json`, or `csv`. Default: `text` |
+| `-f, --format FORMAT` | Output format: `text`, `json`, `csv`, `xml`, or `html`. Default: `text` |
 | `-v, --verbose` | Enable verbose output with detailed error messages |
 | `-q, --quiet` | Suppress progress output, only show summary |
+
+#### Scan Control
+
+| Option | Description |
+|--------|-------------|
+| `--stop-on-success` | Stop testing a host:port after the first successful login |
+| `--max-attempts-per-user NUM` | Max failed attempts per username per host before skipping (lockout protection). 0 = unlimited (default) |
+| `-c, --command CMD` | Execute command on successful login and capture output |
+| `--checkpoint FILE` | Save scan progress to checkpoint file |
+| `--resume FILE` | Resume scan from a checkpoint file |
+
+#### Configuration
+
+| Option | Description |
+|--------|-------------|
+| `--config FILE` | Load configuration from YAML or JSON file. CLI arguments override config file values. |
 
 #### Performance Options
 
@@ -115,10 +145,16 @@ pip install paramiko
 ./sshcheck.py -t 192.168.1.0/24 -u root -p admin123
 ```
 
-### Scan IP range
+### Test empty passwords and username-as-password
 
 ```bash
-./sshcheck.py -t 192.168.1.1-254 -u admin -p password
+./sshcheck.py -t 192.168.1.1 --try-empty --user-as-pass -u root -u admin -u test
+```
+
+### Execute command on successful login with HTML report
+
+```bash
+./sshcheck.py -t 192.168.1.1 -u root -p pass -c "id; uname -a" -f html -o report.html
 ```
 
 ### Scan using credential lists and save JSON output
@@ -127,28 +163,89 @@ pip install paramiko
 ./sshcheck.py -T targets.txt -U users.txt -P passwords.txt -o results.json -f json
 ```
 
-### Multi-threaded scanning with custom timeout
+### Multi-threaded scanning with lockout protection
 
 ```bash
-./sshcheck.py -t 10.0.0.0/24 -u root -p password -n 10 --timeout 5
+./sshcheck.py -t 10.0.0.0/24 -U users.txt -P passwords.txt -n 10 --max-attempts-per-user 3
 ```
 
-### Scan non-standard SSH port
+### Stop after first valid credential per host
 
 ```bash
-./sshcheck.py -t server.example.com -u root -p secret --port 2222
+./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt --stop-on-success
 ```
 
-### Scan multiple ports
+### Scan with checkpoint (resume on interrupt)
 
 ```bash
-./sshcheck.py -t 192.168.1.1 -u root -p pass --port 22 --port 2222 --port 22222
+./sshcheck.py -T targets.txt -U users.txt -P passwords.txt --checkpoint scan.progress
+
+# Resume after interruption
+./sshcheck.py -T targets.txt -U users.txt -P passwords.txt --resume scan.progress
 ```
 
-### Verbose output with multiple credentials
+### Use a configuration file
 
 ```bash
-./sshcheck.py -t 192.168.1.1 -u root -u admin -p pass1 -p pass2 -v
+./sshcheck.py --config examples/scan_profile.json
+```
+
+### Generate XML output for tool integration
+
+```bash
+./sshcheck.py -t 192.168.1.1 -u root -p pass -f xml -o results.xml
+```
+
+## Configuration File
+
+sshcheck supports JSON and YAML configuration files. CLI arguments override config file values.
+
+### JSON Example (`scan_profile.json`)
+
+```json
+{
+  "targets": ["192.168.1.0/24"],
+  "users": ["root", "admin", "ubuntu"],
+  "passwords": ["password", "admin", "changeme"],
+  "ports": [22, 2222],
+  "threads": 10,
+  "timeout": 15,
+  "try_empty": true,
+  "user_as_pass": true,
+  "stop_on_success": true,
+  "max_attempts_per_user": 3,
+  "command": "id; uname -a",
+  "format": "html",
+  "output": "audit_report.html",
+  "checkpoint": "scan_checkpoint.json"
+}
+```
+
+### YAML Example (`scan_profile.yaml`)
+
+```yaml
+targets:
+  - 192.168.1.0/24
+users:
+  - root
+  - admin
+  - ubuntu
+passwords:
+  - password
+  - admin
+  - changeme
+ports:
+  - 22
+  - 2222
+threads: 10
+timeout: 15
+try_empty: true
+user_as_pass: true
+stop_on_success: true
+max_attempts_per_user: 3
+command: "id; uname -a"
+format: html
+output: audit_report.html
 ```
 
 ## Input File Formats
@@ -209,84 +306,42 @@ toor
 
 ## Output Formats
 
-### Text Format
+### Text Format (default)
 
-Human-readable format showing scan statistics and detailed results:
-
-```
-============================================================
-SSH Security Audit - sshcheck v1.0.0
-============================================================
-Targets: 5 host(s)
-Usernames: 3
-Passwords: 4
-Ports: [22]
-Total combinations: 60
-============================================================
-
-[1/60] (  1.7%) [SUCCESS] 192.168.1.1:22 user=admin
-    Output: Welcome to Ubuntu 22.04 LTS...
-
-============================================================
-SCAN SUMMARY
-============================================================
-Total attempts:        60
-Successful logins:     2
-Failed logins:         58
-  - Auth failures:     55
-  - Connection errors: 2
-  - Timeouts:          1
-Duration:              45.32 seconds
-============================================================
-```
+Human-readable format showing scan statistics, severity ratings, and detailed results.
 
 ### JSON Format
 
-Structured JSON with full scan details:
-
-```json
-{
-  "scan_info": {
-    "program": "sshcheck",
-    "version": "1.0.0",
-    "start_time": "2026-01-15T10:30:00",
-    "end_time": "2026-01-15T10:30:45",
-    "duration_seconds": 45.32
-  },
-  "statistics": {
-    "total_attempts": 60,
-    "successful_logins": 2,
-    "failed_logins": 58,
-    "authentication_errors": 55,
-    "connection_errors": 2,
-    "timeout_errors": 1
-  },
-  "results": [
-    {
-      "host": "192.168.1.1",
-      "port": 22,
-      "username": "admin",
-      "password": "password123",
-      "success": true,
-      "timestamp": "2026-01-15T10:30:05",
-      "initial_output": "Welcome to Ubuntu 22.04 LTS\n...",
-      "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3",
-      "error_message": "",
-      "connection_time": 0.523
-    }
-  ]
-}
-```
+Structured JSON with full scan details including host key info, algorithms, OS fingerprinting, and severity assessments.
 
 ### CSV Format
 
-Comma-separated values for spreadsheet import:
+Comma-separated values with columns for all fields including new security assessment data.
 
-```csv
-host,port,username,password,success,timestamp,banner,initial_output,error_message,connection_time
-192.168.1.1,22,admin,password123,True,2026-01-15T10:30:05,SSH-2.0-OpenSSH_8.9,"Welcome to Ubuntu",,0.523
-192.168.1.2,22,root,toor,False,2026-01-15T10:30:10,,,Authentication failed,1.234
-```
+### XML Format
+
+Structured XML output suitable for integration with other security tools.
+
+### HTML Format
+
+Styled HTML report with:
+- Summary statistics cards
+- Successful logins table with severity badges
+- Host key and OS information
+- Command output display
+- Color-coded severity levels (critical/high/medium/low/info)
+
+## Severity Scoring
+
+Each finding is assessed for severity based on multiple factors:
+
+| Severity | Criteria |
+|----------|----------|
+| **CRITICAL** | Root/admin login with default or empty password |
+| **HIGH** | Successful login for non-root user |
+| **MEDIUM** | Weak host keys (DSA, short RSA), vulnerable SSH versions |
+| **LOW** | Weak algorithms supported (RC4, 3DES, MD5-based MACs) |
+| **INFO** | No significant findings |
 
 ## Exit Codes
 
@@ -316,7 +371,8 @@ python -m pytest tests/ -v
 python -m pytest tests/ -v --cov=sshcheck
 
 # Run specific test class
-python -m pytest tests/test_sshcheck.py::TestSSHAuditClientTargetParsing -v
+python -m pytest tests/test_sshcheck.py::TestSeverity -v
+python -m pytest tests/test_sshcheck.py::TestOSFingerprinting -v
 ```
 
 ## Installing the Man Page
@@ -336,7 +392,7 @@ man sshcheck
 
 - **Authorization**: Only use this tool on systems you own or have explicit written permission to test
 - **Password visibility**: Passwords on the command line may be visible in process listings. Use `-P` with password files for sensitive credentials
-- **Rate limiting**: High thread counts may trigger intrusion detection systems or rate limiting
+- **Rate limiting**: High thread counts may trigger intrusion detection systems or rate limiting. Use `--max-attempts-per-user` to avoid account lockouts
 - **Legal compliance**: Unauthorized scanning may violate computer crime laws in your jurisdiction
 
 ## Troubleshooting
@@ -346,6 +402,13 @@ man sshcheck
 Install the required dependency:
 ```bash
 pip install paramiko
+```
+
+### "PyYAML is required for YAML config files"
+
+Install the optional YAML support:
+```bash
+pip install pyyaml
 ```
 
 ### Connection timeouts
@@ -359,11 +422,16 @@ pip install paramiko
 - Reduce thread count with `-n 5`
 - Increase timeout for slow networks
 - Check if targets have fail2ban or similar protection
+- Use `--max-attempts-per-user 3` to avoid lockouts
 
-### Permission denied errors
+### Resuming interrupted scans
 
-- Ensure you have read permissions on input files
-- Ensure you have write permissions for output directory
+Use `--checkpoint` to save progress, then `--resume` to continue:
+```bash
+./sshcheck.py -T targets.txt -U users.txt -P passwords.txt --checkpoint scan.progress
+# After Ctrl+C...
+./sshcheck.py -T targets.txt -U users.txt -P passwords.txt --resume scan.progress
+```
 
 ## Contributing
 

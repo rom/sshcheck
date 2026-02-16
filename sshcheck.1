@@ -1,6 +1,6 @@
 .\" Man page for sshcheck
 .\" Contact: rom@romab.com
-.TH SSHCHECK 1 "January 2026" "sshcheck 1.0.0" "Security Audit Tools"
+.TH SSHCHECK 1 "February 2026" "sshcheck 2.0.0" "Security Audit Tools"
 .SH NAME
 sshcheck \- SSH Security Audit Client for testing login capabilities
 .SH SYNOPSIS
@@ -8,7 +8,11 @@ sshcheck \- SSH Security Audit Client for testing login capabilities
 [\fB\-t\fR \fIHOST\fR | \fB\-T\fR \fIFILE\fR]
 [\fB\-u\fR \fIUSER\fR | \fB\-U\fR \fIFILE\fR]
 [\fB\-p\fR \fIPASS\fR | \fB\-P\fR \fIFILE\fR]
+[\fB\-\-try\-empty\fR]
+[\fB\-\-user\-as\-pass\fR]
 [\fB\-\-port\fR \fIPORT\fR | \fB\-\-port-file\fR \fIFILE\fR]
+[\fB\-c\fR \fICMD\fR]
+[\fB\-\-config\fR \fIFILE\fR]
 [\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B sshcheck
@@ -16,9 +20,19 @@ is a security audit tool designed for testing SSH login capabilities across mult
 It attempts to authenticate to target SSH servers using provided credentials and captures
 initial server output including welcome messages, banners, and shell prompts.
 .PP
+The tool provides host key fingerprinting, SSH algorithm enumeration with weak algorithm
+detection, OS/version fingerprinting from SSH banners, automatic severity scoring of
+findings, post-authentication command execution, and multiple output formats including
+styled HTML reports.
+.PP
 This tool is intended for authorized penetration testing, security assessments, and
 network audits. Always ensure you have proper authorization before scanning any systems.
 .SH OPTIONS
+.SS "Configuration"
+.TP
+.BR \-\-config " " \fIFILE\fR
+Load configuration from YAML or JSON file. All scan parameters can be specified
+in the config file. CLI arguments override config file values.
 .SS "Target Specification"
 .TP
 .BR \-t ", " \-\-target " " \fIHOST\fR
@@ -51,6 +65,14 @@ Password(s) to try. Can be specified multiple times for multiple passwords.
 .TP
 .BR \-P ", " \-\-password-file " " \fIFILE\fR
 File containing passwords, one per line. Lines starting with # are treated as comments.
+.TP
+.BR \-\-try\-empty
+Also try an empty/null password for each username. Useful for detecting accounts
+that allow passwordless login.
+.TP
+.BR \-\-user\-as\-pass
+Also try the username as the password for each user. Tests for the common
+misconfiguration where the password equals the username.
 .SS "Port Specification"
 .TP
 .BR \-\-port " " \fIPORT\fR
@@ -69,9 +91,13 @@ Output format for the results file. Valid options:
 .IP \fBtext\fR
 Human-readable text format (default)
 .IP \fBjson\fR
-JSON format with full scan details and statistics
+JSON format with full scan details, host key info, algorithms, and severity
 .IP \fBcsv\fR
 Comma-separated values for spreadsheet import
+.IP \fBxml\fR
+Structured XML format for tool integration
+.IP \fBhtml\fR
+Styled HTML report with summary cards, severity badges, and color coding
 .RE
 .TP
 .BR \-v ", " \-\-verbose
@@ -79,6 +105,29 @@ Enable verbose output with detailed error messages and debug information.
 .TP
 .BR \-q ", " \-\-quiet
 Suppress progress output, only show final summary.
+.SS "Scan Control"
+.TP
+.BR \-\-stop\-on\-success
+Stop testing a host:port combination after the first successful login is found.
+Saves time on large scans where only one valid credential per host is needed.
+.TP
+.BR \-\-max\-attempts\-per\-user " " \fINUM\fR
+Maximum number of failed password attempts per username per host before skipping
+further attempts for that user. Protects against account lockout on systems with
+lockout policies. Set to 0 for unlimited (default).
+.TP
+.BR \-c ", " \-\-command " " \fICMD\fR
+Execute the specified command on each successful login and capture the output.
+The command is run via exec_command. When this option is used, the initial shell
+output capture is skipped in favor of command output.
+.TP
+.BR \-\-checkpoint " " \fIFILE\fR
+Save scan progress to a JSON checkpoint file. Progress is saved periodically
+during scanning and when the scan is interrupted with Ctrl+C.
+.TP
+.BR \-\-resume " " \fIFILE\fR
+Resume a previously interrupted scan from a checkpoint file. Already completed
+attempts are skipped and previous results are restored.
 .SS "Performance Options"
 .TP
 .BR \-n ", " \-\-threads " " \fINUM\fR
@@ -96,70 +145,63 @@ Display version information and exit.
 .TP
 .BR \-h ", " \-\-help
 Display help message and exit.
+.SH SECURITY FEATURES
+.SS "Host Key Fingerprinting"
+For each successful connection, sshcheck collects the server's host key type
+(e.g., ssh-ed25519, ssh-rsa), SHA-256 fingerprint, and key size in bits.
+Weak host keys such as DSA and short RSA keys are flagged in the severity assessment.
+.SS "Algorithm Enumeration"
+The tool reports available key exchange, cipher, MAC, and host key algorithms.
+Weak algorithms are identified, including: RC4/arcfour ciphers, CBC mode ciphers,
+MD5 and SHA-1 based MACs, DSA host keys, and weak Diffie-Hellman groups.
+.SS "OS/Version Fingerprinting"
+SSH banners are parsed to identify the operating system (Ubuntu, Debian, FreeBSD,
+CentOS, Windows, etc.), OS family, and SSH software version. Known vulnerable
+OpenSSH versions are flagged with appropriate severity levels.
+.SS "Severity Scoring"
+Each finding is automatically assessed for severity:
+.TP
+\fBCRITICAL\fR \- Root/admin login with default, empty, or username-as-password credentials.
+.TP
+\fBHIGH\fR \- Successful login for non-privileged users.
+.TP
+\fBMEDIUM\fR \- Weak host keys (DSA, short RSA), vulnerable SSH versions.
+.TP
+\fBLOW\fR \- Weak algorithms supported (RC4, 3DES, MD5-based MACs).
+.TP
+\fBINFO\fR \- No significant security findings.
+.SH CONFIGURATION FILE
+Configuration files support all scan parameters. CLI arguments override config values.
+.PP
+JSON example:
+.PP
+.nf
+{
+  "targets": ["192.168.1.0/24"],
+  "users": ["root", "admin"],
+  "passwords": ["password", "changeme"],
+  "threads": 10,
+  "try_empty": true,
+  "user_as_pass": true,
+  "stop_on_success": true,
+  "max_attempts_per_user": 3,
+  "command": "id; uname -a",
+  "format": "html",
+  "output": "report.html"
+}
+.fi
+.PP
+YAML configuration files require the \fBpyyaml\fR package.
 .SH INPUT FILE FORMATS
-.SS "Target File Format"
-The target file should contain one target per line. Supported formats:
-.PP
-.nf
-.RS
-# Comment line (ignored)
-192.168.1.1
-192.168.1.0/24
-10.0.0.1-254
-server.example.com
-.RE
-.fi
-.SS "Username File Format"
-The username file should contain one username per line:
-.PP
-.nf
-.RS
-# Common usernames
-root
-admin
-administrator
-user
-.RE
-.fi
-.SS "Password File Format"
-The password file should contain one password per line:
-.PP
-.nf
-.RS
-# Common passwords
-password
-admin
-123456
-password123
-.RE
-.fi
-.SS "Port File Format"
-The port file should contain one port number per line:
-.PP
-.nf
-.RS
-# Common SSH ports
-22
-2222
-22222
-.RE
-.fi
-.SH OUTPUT FILE FORMATS
-.SS "Text Format"
-Human-readable format containing scan statistics and detailed results
-for successful logins, including captured output.
-.SS "JSON Format"
-Structured JSON containing:
+All input files (targets, usernames, passwords, ports) support:
 .IP \(bu 2
-\fBscan_info\fR: Program version, timestamps, duration
+One entry per line
 .IP \(bu 2
-\fBstatistics\fR: Attempt counts, success/failure rates
+Lines starting with # are treated as comments
 .IP \(bu 2
-\fBresults\fR: Array of all scan results with full details
-.SS "CSV Format"
-Comma-separated values with headers:
-.PP
-host, port, username, password, success, timestamp, banner, initial_output, error_message, connection_time
+Empty lines are ignored
+.IP \(bu 2
+Leading and trailing whitespace is stripped
 .SH EXIT STATUS
 .TP
 .B 0
@@ -169,29 +211,28 @@ At least one successful login was found.
 No successful logins found or error occurred.
 .TP
 .B 130
-Scan was interrupted by user (Ctrl+C).
+Scan was interrupted by user (Ctrl+C). Checkpoint is saved if configured.
 .SH EXAMPLES
 .TP
 Scan single host with single credentials:
 .B sshcheck -t 192.168.1.1 -u admin -p password123
 .TP
-Scan entire subnet:
-.B sshcheck -t 192.168.1.0/24 -u root -p admin123
+Test empty passwords and username-as-password:
+.B sshcheck -t 192.168.1.1 --try-empty --user-as-pass -u root -u admin
 .TP
-Scan using credential lists and save JSON output:
-.B sshcheck -T targets.txt -U users.txt -P passwords.txt -o results.json -f json
+Execute command on success with HTML report:
+.B sshcheck -t 192.168.1.1 -u root -p pass -c "id; uname -a" -f html -o report.html
 .TP
-Scan IP range with 10 threads and 5 second timeout:
-.B sshcheck -t 10.0.0.1-254 -u admin -p password -n 10 --timeout 5
+Scan subnet with lockout protection:
+.B sshcheck -t 10.0.0.0/24 -U users.txt -P passwords.txt -n 10 --max-attempts-per-user 3
 .TP
-Scan non-standard SSH port:
-.B sshcheck -t server.example.com -u root -p secret --port 2222
+Scan with checkpoint and resume:
+.B sshcheck -T targets.txt -U users.txt -P passwords.txt --checkpoint scan.json
+.br
+.B sshcheck -T targets.txt -U users.txt -P passwords.txt --resume scan.json
 .TP
-Scan multiple ports:
-.B sshcheck -t 192.168.1.1 -u root -p pass --port 22 --port 2222 --port 22222
-.TP
-Verbose scanning with multiple users and passwords:
-.B sshcheck -t 192.168.1.1 -u root -u admin -p pass1 -p pass2 -v
+Use configuration file:
+.B sshcheck --config scan_profile.yaml
 .SH ERROR MESSAGES
 .TP
 .B "Authentication failed"
@@ -199,48 +240,46 @@ The username/password combination was rejected by the server.
 .TP
 .B "Connection timed out"
 The host did not respond within the timeout period.
-Check if the host is reachable and SSH service is running.
 .TP
 .B "Connection refused"
-The target host actively refused the connection.
 SSH service may not be running on the specified port.
 .TP
 .B "No route to host"
 Network path to the target is unavailable.
-Check network configuration and routing.
 .TP
 .B "Network is unreachable"
 Cannot reach the target network.
-Verify network connectivity.
 .SH FILES
 .TP
-.I targets.txt
+.I examples/targets.txt
 Example target hosts file
 .TP
-.I users.txt
+.I examples/users.txt
 Example usernames file
 .TP
-.I passwords.txt
+.I examples/passwords.txt
 Example passwords file
 .TP
-.I results.json
-Default JSON output file
+.I examples/scan_profile.json
+Example JSON configuration file
 .SH SECURITY CONSIDERATIONS
 .PP
 This tool is designed for authorized security testing only.
 Unauthorized use against systems you do not own or have explicit
 permission to test may violate computer crime laws.
 .PP
-Always ensure you have written authorization before performing
-security assessments.
-.PP
 Passwords provided on the command line may be visible in process
 listings. Use password files (\fB-P\fR) for sensitive credentials.
+.PP
+Checkpoint files contain scan results including passwords. Store
+them securely and delete after use.
 .SH REQUIREMENTS
 .IP \(bu 2
 Python 3.6 or later
 .IP \(bu 2
-paramiko library (pip install paramiko)
+paramiko >= 2.7.0 (pip install paramiko)
+.IP \(bu 2
+pyyaml >= 5.0.0 (optional, for YAML config files)
 .SH BUGS
 Report bugs at: https://github.com/rom/sshcheck/issues
 .SH AUTHOR

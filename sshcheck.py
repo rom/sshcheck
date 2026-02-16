@@ -10,12 +10,15 @@ License: MIT
 """
 
 import argparse
+import base64
 import csv
 import hashlib
 import ipaddress
 import json
 import logging
 import os
+import random
+import re
 import socket
 import sys
 import time
@@ -43,7 +46,7 @@ except ImportError:
 
 
 # Version information
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 __program_name__ = "sshcheck"
 
 
@@ -125,6 +128,24 @@ OS_FINGERPRINTS = [
     ("OpenSSH", "OpenSSH (generic)", "Unix"),
 ]
 
+# Known honeypot signatures
+HONEYPOT_SIGNATURES = {
+    "banners": [
+        "SSH-2.0-libssh-0.6.0",  # Cowrie default
+        "SSH-2.0-OpenSSH_6.0p1 Debian-4+deb7u2",  # Common Cowrie
+        "SSH-2.0-OpenSSH_5.1p1 Debian-5",  # Kippo default
+    ],
+    "banner_patterns": [
+        r"SSH-2\.0-libssh-0\.[56]\.",  # Older libssh versions used by Cowrie
+    ],
+    "suspicious_outputs": [
+        "root@svr04",  # Default Cowrie hostname
+        "root@nas3",   # Default Cowrie hostname
+        "root@server",  # Generic honeypot
+        "uid=0(root) gid=0(root) groups=0(root)",  # Exact default output
+    ],
+}
+
 
 @dataclass
 class ScanResult:
@@ -150,6 +171,10 @@ class ScanResult:
     severity: str = ""
     severity_reasons: Optional[List[str]] = None
     command_output: str = ""
+    honeypot_score: float = 0.0
+    honeypot_reasons: Optional[List[str]] = None
+    host_key_changed: bool = False
+    host_key_previous: str = ""
 
     def to_dict(self) -> dict:
         """Convert result to dictionary."""
@@ -161,6 +186,8 @@ class ScanResult:
             d['weak_algorithms'] = {}
         if d['severity_reasons'] is None:
             d['severity_reasons'] = []
+        if d['honeypot_reasons'] is None:
+            d['honeypot_reasons'] = []
         return d
 
 
@@ -211,6 +238,11 @@ class SSHAuditClient:
         max_attempts_per_user: int = 0,
         command: Optional[str] = None,
         checkpoint_file: Optional[str] = None,
+        spray_mode: bool = False,
+        exclude_hosts: Optional[List[str]] = None,
+        detect_honeypot: bool = False,
+        known_hosts_file: Optional[str] = None,
+        baseline_file: Optional[str] = None,
     ):
         self.timeout = timeout
         self.verbose = verbose
@@ -224,6 +256,11 @@ class SSHAuditClient:
         self.max_attempts_per_user = max_attempts_per_user
         self.command = command
         self.checkpoint_file = checkpoint_file
+        self.spray_mode = spray_mode
+        self.exclude_hosts = exclude_hosts or []
+        self.detect_honeypot = detect_honeypot
+        self.known_hosts_file = known_hosts_file
+        self.baseline_file = baseline_file
         self.results: List[ScanResult] = []
         self.stats = ScanStatistics()
         self._setup_logging()
@@ -232,6 +269,15 @@ class SSHAuditClient:
         self._failure_counts: Dict[str, int] = {}
         # Track hosts with successful logins for stop-on-success
         self._successful_hosts: Set[str] = set()
+        # Known host keys for MITM detection
+        self._known_host_keys: Dict[str, Tuple[str, str]] = {}  # host:port -> (type, fingerprint)
+        # Load known hosts if provided
+        if self.known_hosts_file:
+            self._load_known_hosts()
+        # Excluded host set (expanded from CIDRs, ranges, etc.)
+        self._excluded_set: Set[str] = set()
+        if self.exclude_hosts:
+            self._build_exclusion_set()
 
         # Suppress paramiko logging unless verbose
         if not verbose:
@@ -246,6 +292,381 @@ class SSHAuditClient:
             datefmt="%Y-%m-%d %H:%M:%S"
         )
         self.logger = logging.getLogger(__name__)
+
+    def _build_exclusion_set(self):
+        """Build the set of excluded hosts from exclusion list."""
+        for host in self.exclude_hosts:
+            for expanded in self._parse_targets([host]):
+                self._excluded_set.add(expanded)
+
+    def _is_excluded(self, host: str) -> bool:
+        """Check if a host is in the exclusion set."""
+        return host in self._excluded_set
+
+    def _load_known_hosts(self):
+        """
+        Load known host keys from a file for MITM detection.
+
+        Supports two formats:
+        1. OpenSSH known_hosts format: hostname key-type base64-key
+        2. sshcheck JSON format: {"host:port": {"type": "...", "fingerprint": "..."}}
+        """
+        path = Path(self.known_hosts_file)
+        if not path.exists():
+            if self.verbose:
+                self.logger.warning(f"Known hosts file not found: {self.known_hosts_file}")
+            return
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+
+            # Try JSON format first (sshcheck's own format)
+            if content.startswith('{'):
+                data = json.loads(content)
+                for host_port, info in data.items():
+                    self._known_host_keys[host_port] = (
+                        info.get('type', ''),
+                        info.get('fingerprint', '')
+                    )
+                return
+
+            # Parse OpenSSH known_hosts format
+            for line in content.splitlines():
+                line = line.strip()
+                if not line or line.startswith('#') or line.startswith('@'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 3:
+                    hostnames = parts[0]
+                    key_type = parts[1]
+                    key_b64 = parts[2]
+                    # Compute fingerprint from the base64-encoded key
+                    try:
+                        key_bytes = base64.b64decode(key_b64)
+                        fp = hashlib.sha256(key_bytes).hexdigest()
+                        fp_formatted = ':'.join(
+                            fp[i:i+2] for i in range(0, len(fp), 2)
+                        )
+                        fingerprint = f"SHA256:{fp_formatted}"
+                    except Exception:
+                        fingerprint = ""
+
+                    # Handle multiple hostnames (comma-separated)
+                    for hostname in hostnames.split(','):
+                        hostname = hostname.strip().strip('[]')
+                        # Determine port: [host]:port or just host (default 22)
+                        if ':' in hostname and not hostname.startswith('['):
+                            # Could be IPv6 or host:port
+                            host_key = hostname
+                        else:
+                            # Default to port 22
+                            host_key = f"{hostname}:22"
+                        self._known_host_keys[host_key] = (key_type, fingerprint)
+
+        except Exception as e:
+            if self.verbose:
+                self.logger.warning(f"Failed to load known hosts: {e}")
+
+    def _check_host_key_continuity(self, host: str, port: int,
+                                    key_type: str, fingerprint: str) -> Tuple[bool, str]:
+        """
+        Check if a host key has changed compared to known hosts.
+
+        Returns:
+            Tuple of (has_changed, previous_fingerprint)
+        """
+        host_key = f"{host}:{port}"
+        if host_key in self._known_host_keys:
+            known_type, known_fp = self._known_host_keys[host_key]
+            if known_fp and fingerprint and known_fp != fingerprint:
+                return (True, known_fp)
+        return (False, "")
+
+    def _save_known_hosts(self, filepath: str):
+        """
+        Save discovered host keys to a JSON file for future comparison.
+        """
+        host_keys: Dict[str, Dict[str, str]] = {}
+        seen = set()
+        for result in self.results:
+            host_port = f"{result.host}:{result.port}"
+            if host_port not in seen and result.host_key_type and result.host_key_fingerprint:
+                host_keys[host_port] = {
+                    "type": result.host_key_type,
+                    "fingerprint": result.host_key_fingerprint,
+                    "bits": result.host_key_bits,
+                    "last_seen": result.timestamp,
+                }
+                seen.add(host_port)
+
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(host_keys, f, indent=2)
+        except Exception as e:
+            if self.verbose:
+                self.logger.warning(f"Failed to save known hosts: {e}")
+
+    def _detect_honeypot_indicators(self, result: ScanResult) -> Tuple[float, List[str]]:
+        """
+        Analyze a scan result for honeypot indicators.
+
+        Returns:
+            Tuple of (honeypot_score 0.0-1.0, list_of_reasons)
+        """
+        score = 0.0
+        reasons: List[str] = []
+
+        # Check banner against known honeypot signatures
+        if result.banner:
+            for sig_banner in HONEYPOT_SIGNATURES["banners"]:
+                if result.banner == sig_banner:
+                    score += 0.4
+                    reasons.append(f"Known honeypot banner: {result.banner}")
+                    break
+
+            for pattern in HONEYPOT_SIGNATURES["banner_patterns"]:
+                if re.search(pattern, result.banner):
+                    score += 0.3
+                    reasons.append(f"Suspicious banner pattern match")
+                    break
+
+        # Check initial output for honeypot signatures
+        if result.initial_output:
+            for sig_output in HONEYPOT_SIGNATURES["suspicious_outputs"]:
+                if sig_output in result.initial_output:
+                    score += 0.2
+                    reasons.append(f"Known honeypot output pattern: {sig_output}")
+                    break
+
+        # Extremely fast connection time is suspicious (< 0.05s on a non-local host)
+        if result.connection_time > 0 and result.connection_time < 0.05 and result.success:
+            score += 0.1
+            reasons.append(f"Suspiciously fast connection ({result.connection_time:.3f}s)")
+
+        # Accepting root with common/empty passwords is a red flag
+        if result.success and result.username == "root":
+            if result.password in ("", "root", "toor", "password", "123456"):
+                score += 0.2
+                reasons.append(f"Root login with trivial password '{result.password}'")
+
+        # Cap score at 1.0
+        score = min(score, 1.0)
+
+        return (score, reasons)
+
+    @staticmethod
+    def import_nmap_xml(filepath: str) -> List[str]:
+        """
+        Import targets from an Nmap XML output file.
+
+        Extracts hosts that have SSH ports open (22, 2222, or any port
+        with service name 'ssh').
+
+        Args:
+            filepath: Path to the Nmap XML file
+
+        Returns:
+            List of "host:port" strings for hosts with SSH open
+        """
+        path = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"Nmap XML file not found: {filepath}")
+
+        try:
+            tree = ET.parse(filepath)
+            root = tree.getroot()
+        except ET.ParseError as e:
+            raise ValueError(f"Invalid XML in Nmap file: {e}")
+
+        targets = []
+        for host_elem in root.findall('.//host'):
+            # Get host address
+            addr_elem = host_elem.find('address')
+            if addr_elem is None:
+                continue
+            host_addr = addr_elem.get('addr', '')
+
+            # Check if host is up
+            status_elem = host_elem.find('status')
+            if status_elem is not None and status_elem.get('state') != 'up':
+                continue
+
+            # Check ports for SSH
+            ports_elem = host_elem.find('ports')
+            if ports_elem is None:
+                continue
+
+            for port_elem in ports_elem.findall('port'):
+                port_id = port_elem.get('portid', '')
+                protocol = port_elem.get('protocol', 'tcp')
+
+                # Skip non-TCP ports
+                if protocol != 'tcp':
+                    continue
+
+                # Check if port is open
+                state_elem = port_elem.find('state')
+                if state_elem is None or state_elem.get('state') != 'open':
+                    continue
+
+                # Check if service is SSH
+                service_elem = port_elem.find('service')
+                is_ssh = False
+                if service_elem is not None:
+                    service_name = service_elem.get('name', '').lower()
+                    if 'ssh' in service_name:
+                        is_ssh = True
+
+                # Also accept common SSH ports even without service detection
+                if port_id in ('22', '2222', '22222', '8022'):
+                    is_ssh = True
+
+                if is_ssh and port_id:
+                    targets.append(f"{host_addr}:{port_id}")
+
+        return targets
+
+    @staticmethod
+    def compare_baseline(current_results: List['ScanResult'],
+                         baseline_path: str) -> Dict[str, Any]:
+        """
+        Compare current scan results against a baseline (previous scan).
+
+        Args:
+            current_results: List of current ScanResult objects
+            baseline_path: Path to a JSON baseline file (previous scan output)
+
+        Returns:
+            Dictionary with comparison results
+        """
+        path = Path(baseline_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Baseline file not found: {baseline_path}")
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                baseline_data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in baseline file: {e}")
+
+        baseline_results = baseline_data.get('results', [])
+
+        # Build lookup sets for comparison
+        def _result_key(r):
+            """Create a unique key for a result."""
+            if isinstance(r, dict):
+                return (r.get('host', ''), r.get('port', 0),
+                        r.get('username', ''), r.get('password', ''))
+            return (r.host, r.port, r.username, r.password)
+
+        def _host_port_key(r):
+            if isinstance(r, dict):
+                return (r.get('host', ''), r.get('port', 0))
+            return (r.host, r.port)
+
+        # Baseline data
+        baseline_successes = {
+            _result_key(r) for r in baseline_results
+            if (isinstance(r, dict) and r.get('success'))
+        }
+        baseline_hosts = {
+            _host_port_key(r) for r in baseline_results
+        }
+        baseline_host_keys = {}
+        for r in baseline_results:
+            if isinstance(r, dict):
+                hp = _host_port_key(r)
+                if r.get('host_key_fingerprint'):
+                    baseline_host_keys[hp] = {
+                        'type': r.get('host_key_type', ''),
+                        'fingerprint': r.get('host_key_fingerprint', ''),
+                    }
+        baseline_ssh_versions = {}
+        for r in baseline_results:
+            if isinstance(r, dict):
+                hp = _host_port_key(r)
+                if r.get('ssh_version'):
+                    baseline_ssh_versions[hp] = r.get('ssh_version', '')
+
+        # Current data
+        current_successes = {
+            _result_key(r) for r in current_results if r.success
+        }
+        current_hosts = {
+            _host_port_key(r) for r in current_results
+        }
+        current_host_keys = {}
+        for r in current_results:
+            hp = _host_port_key(r)
+            if r.host_key_fingerprint:
+                current_host_keys[hp] = {
+                    'type': r.host_key_type,
+                    'fingerprint': r.host_key_fingerprint,
+                }
+        current_ssh_versions = {}
+        for r in current_results:
+            hp = _host_port_key(r)
+            if r.ssh_version:
+                current_ssh_versions[hp] = r.ssh_version
+
+        # Compute differences
+        new_hosts = current_hosts - baseline_hosts
+        removed_hosts = baseline_hosts - current_hosts
+        new_credentials = current_successes - baseline_successes
+        lost_credentials = baseline_successes - current_successes
+
+        # Host key changes
+        host_key_changes = []
+        for hp in current_host_keys:
+            if hp in baseline_host_keys:
+                if (current_host_keys[hp]['fingerprint'] !=
+                        baseline_host_keys[hp]['fingerprint']):
+                    host_key_changes.append({
+                        'host': hp[0],
+                        'port': hp[1],
+                        'previous_type': baseline_host_keys[hp]['type'],
+                        'previous_fingerprint': baseline_host_keys[hp]['fingerprint'],
+                        'current_type': current_host_keys[hp]['type'],
+                        'current_fingerprint': current_host_keys[hp]['fingerprint'],
+                    })
+
+        # SSH version changes
+        ssh_version_changes = []
+        for hp in current_ssh_versions:
+            if hp in baseline_ssh_versions:
+                if current_ssh_versions[hp] != baseline_ssh_versions[hp]:
+                    ssh_version_changes.append({
+                        'host': hp[0],
+                        'port': hp[1],
+                        'previous_version': baseline_ssh_versions[hp],
+                        'current_version': current_ssh_versions[hp],
+                    })
+
+        diff = {
+            'new_hosts': [{'host': h, 'port': p} for h, p in new_hosts],
+            'removed_hosts': [{'host': h, 'port': p} for h, p in removed_hosts],
+            'new_credentials': [
+                {'host': h, 'port': p, 'username': u, 'password': pw}
+                for h, p, u, pw in new_credentials
+            ],
+            'lost_credentials': [
+                {'host': h, 'port': p, 'username': u, 'password': pw}
+                for h, p, u, pw in lost_credentials
+            ],
+            'host_key_changes': host_key_changes,
+            'ssh_version_changes': ssh_version_changes,
+            'summary': {
+                'new_hosts_count': len(new_hosts),
+                'removed_hosts_count': len(removed_hosts),
+                'new_credentials_count': len(new_credentials),
+                'lost_credentials_count': len(lost_credentials),
+                'host_key_changes_count': len(host_key_changes),
+                'ssh_version_changes_count': len(ssh_version_changes),
+            }
+        }
+
+        return diff
 
     def _parse_targets(self, targets: List[str]) -> Generator[str, None, None]:
         """
@@ -517,6 +938,14 @@ class SSHAuditClient:
                 severity = max(severity, SeverityLevel.LOW, key=lambda s: _severity_rank(s))
                 reasons.append(f"{weak_count} weak algorithm(s) supported")
 
+        # Check for host key change (possible MITM)
+        if result.host_key_changed:
+            severity = max(severity, SeverityLevel.CRITICAL, key=lambda s: _severity_rank(s))
+            reasons.append(
+                f"HOST KEY CHANGED - possible MITM attack! "
+                f"Previous: {result.host_key_previous}"
+            )
+
         if not reasons:
             reasons.append("No significant findings")
 
@@ -678,10 +1107,26 @@ class SSHAuditClient:
         result.connection_time = time.time() - start_time
         self.stats.total_attempts += 1
 
+        # Check host key continuity
+        if self._known_host_keys and result.host_key_fingerprint:
+            changed, prev_fp = self._check_host_key_continuity(
+                result.host, result.port,
+                result.host_key_type, result.host_key_fingerprint
+            )
+            if changed:
+                result.host_key_changed = True
+                result.host_key_previous = prev_fp
+
         # Assess severity
         severity, reasons = self._assess_severity(result)
         result.severity = severity
         result.severity_reasons = reasons
+
+        # Honeypot detection
+        if self.detect_honeypot:
+            hp_score, hp_reasons = self._detect_honeypot_indicators(result)
+            result.honeypot_score = hp_score
+            result.honeypot_reasons = hp_reasons
 
         return result
 
@@ -752,6 +1197,15 @@ class SSHAuditClient:
 
             if result.host_key_fingerprint:
                 print(f"    Host Key: {result.host_key_type} ({result.host_key_fingerprint})")
+
+            if result.host_key_changed:
+                print(f"    \033[91m!!! HOST KEY CHANGED - possible MITM !!!\033[0m")
+                print(f"    Previous: {result.host_key_previous}")
+
+            if result.honeypot_score >= 0.5:
+                print(f"    \033[93m⚠ Possible honeypot (score: {result.honeypot_score:.1f})\033[0m")
+                for hr in (result.honeypot_reasons or []):
+                    print(f"      - {hr}")
 
         if self.verbose and result.error_message:
             print(f"    Error: {result.error_message}")
@@ -832,8 +1286,14 @@ class SSHAuditClient:
         self._failure_counts = {}
         self._successful_hosts = set()
 
-        # Build list of all hosts
-        hosts = list(set(self._parse_targets(targets)))
+        # Build list of all hosts, applying exclusions
+        hosts = []
+        for h in set(self._parse_targets(targets)):
+            if self._is_excluded(h):
+                if not self.quiet:
+                    self.logger.debug(f"Excluding host: {h}")
+                continue
+            hosts.append(h)
 
         if not hosts:
             print("ERROR: No valid target hosts specified.", file=sys.stderr)
@@ -853,14 +1313,33 @@ class SSHAuditClient:
         if not ports:
             ports = [22]
 
-        # Build work items - passwords are expanded per-username for try_empty/user_as_pass
+        # Build work items - order depends on spray mode
         work_items = []
-        for host in hosts:
-            for port in ports:
-                for username in usernames:
-                    pw_list = self._build_password_list(passwords, username)
-                    for password in pw_list:
-                        work_items.append((host, port, username, password))
+        if self.spray_mode:
+            # Spray mode: try one password across all users/hosts before next password
+            # Build the unique password set across all users
+            all_pw_sets = {}
+            for username in usernames:
+                all_pw_sets[username] = self._build_password_list(passwords, username)
+
+            # Find the maximum password list length
+            max_pw_len = max(len(v) for v in all_pw_sets.values()) if all_pw_sets else 0
+
+            for pw_idx in range(max_pw_len):
+                for host in hosts:
+                    for port in ports:
+                        for username in usernames:
+                            pw_list = all_pw_sets[username]
+                            if pw_idx < len(pw_list):
+                                work_items.append((host, port, username, pw_list[pw_idx]))
+        else:
+            # Normal mode: try all passwords per user per host
+            for host in hosts:
+                for port in ports:
+                    for username in usernames:
+                        pw_list = self._build_password_list(passwords, username)
+                        for password in pw_list:
+                            work_items.append((host, port, username, password))
 
         total = len(work_items)
 
@@ -912,6 +1391,16 @@ class SSHAuditClient:
                 print(f"Max attempts per user: {self.max_attempts_per_user}")
             if self.command:
                 print(f"Post-auth command: {self.command}")
+            if self.spray_mode:
+                print(f"Spray mode: enabled (one password per round)")
+            if self._excluded_set:
+                print(f"Excluded hosts: {len(self._excluded_set)}")
+            if self.detect_honeypot:
+                print(f"Honeypot detection: enabled")
+            if self._known_host_keys:
+                print(f"Known hosts loaded: {len(self._known_host_keys)}")
+            if self.baseline_file:
+                print(f"Baseline comparison: {self.baseline_file}")
             print(f"{'='*60}\n")
 
         completed_items = list(completed_set)
@@ -987,6 +1476,25 @@ class SSHAuditClient:
         if self.output_file:
             self._save_results()
 
+        # Save discovered host keys for future comparison
+        if self.known_hosts_file:
+            self._save_known_hosts(self.known_hosts_file)
+
+        # Baseline comparison
+        if self.baseline_file:
+            try:
+                diff = self.compare_baseline(self.results, self.baseline_file)
+                self._print_baseline_diff(diff)
+                # Save diff alongside output
+                if self.output_file:
+                    diff_path = str(Path(self.output_file).with_suffix('.diff.json'))
+                    with open(diff_path, 'w', encoding='utf-8') as f:
+                        json.dump(diff, f, indent=2)
+                    if not self.quiet:
+                        print(f"Baseline diff saved to: {diff_path}")
+            except (FileNotFoundError, ValueError) as e:
+                print(f"WARNING: Baseline comparison failed: {e}", file=sys.stderr)
+
         return self.results
 
     def _print_summary(self):
@@ -1038,7 +1546,63 @@ class SSHAuditClient:
                 if r.severity_reasons:
                     for reason in r.severity_reasons:
                         print(f"    ! {reason}")
+                if r.host_key_changed:
+                    print(f"    \033[91m!!! HOST KEY CHANGED !!!\033[0m")
+                if r.honeypot_score >= 0.5:
+                    print(f"    ⚠ Honeypot score: {r.honeypot_score:.1f}")
             print()
+
+    def _print_baseline_diff(self, diff: Dict[str, Any]):
+        """Print baseline comparison results."""
+        if self.quiet:
+            return
+
+        summary = diff.get('summary', {})
+        total_changes = sum(summary.values())
+
+        if total_changes == 0:
+            print("\nBASELINE COMPARISON: No changes detected.")
+            return
+
+        print(f"\n{'='*60}")
+        print("BASELINE COMPARISON")
+        print(f"{'='*60}")
+
+        if diff['new_hosts']:
+            print(f"\n  NEW HOSTS ({len(diff['new_hosts'])}):")
+            for h in diff['new_hosts']:
+                print(f"    + {h['host']}:{h['port']}")
+
+        if diff['removed_hosts']:
+            print(f"\n  REMOVED HOSTS ({len(diff['removed_hosts'])}):")
+            for h in diff['removed_hosts']:
+                print(f"    - {h['host']}:{h['port']}")
+
+        if diff['new_credentials']:
+            print(f"\n  NEW CREDENTIALS ({len(diff['new_credentials'])}):")
+            for c in diff['new_credentials']:
+                print(f"    + {c['host']}:{c['port']} {c['username']}:{c['password']}")
+
+        if diff['lost_credentials']:
+            print(f"\n  LOST CREDENTIALS ({len(diff['lost_credentials'])}):")
+            for c in diff['lost_credentials']:
+                print(f"    - {c['host']}:{c['port']} {c['username']}:{c['password']}")
+
+        if diff['host_key_changes']:
+            print(f"\n  \033[91mHOST KEY CHANGES ({len(diff['host_key_changes'])}):\033[0m")
+            for hk in diff['host_key_changes']:
+                print(f"    ! {hk['host']}:{hk['port']}")
+                print(f"      Previous: {hk['previous_type']} {hk['previous_fingerprint']}")
+                print(f"      Current:  {hk['current_type']} {hk['current_fingerprint']}")
+
+        if diff['ssh_version_changes']:
+            print(f"\n  SSH VERSION CHANGES ({len(diff['ssh_version_changes'])}):")
+            for sv in diff['ssh_version_changes']:
+                print(f"    ~ {sv['host']}:{sv['port']}")
+                print(f"      Previous: {sv['previous_version']}")
+                print(f"      Current:  {sv['current_version']}")
+
+        print(f"{'='*60}")
 
     def _save_results(self):
         """Save scan results to output file."""
@@ -1483,6 +2047,24 @@ Examples:
   %(prog)s --config scan_profile.yaml
       Run scan using configuration file
 
+  %(prog)s -t 192.168.1.0/24 --exclude 192.168.1.1 --exclude 192.168.1.254 -u root -p pass
+      Scan subnet but exclude specific hosts
+
+  %(prog)s -t 192.168.1.0/24 -U users.txt -P passwords.txt --spray -n 5
+      Credential spraying: one password per round across all hosts/users
+
+  %(prog)s --import-nmap scan.xml -U users.txt -P passwords.txt
+      Import targets from Nmap XML output
+
+  %(prog)s -t 192.168.1.1 -u root -p pass --detect-honeypot
+      Scan with honeypot detection enabled
+
+  %(prog)s -t 192.168.1.1 -u root -p pass --known-hosts hosts.json
+      Check host keys against known hosts file for MITM detection
+
+  %(prog)s -t 192.168.1.0/24 -u root -p pass --baseline previous_scan.json
+      Compare results against a previous scan baseline
+
 Report bugs to: https://github.com/rom/sshcheck/issues
         """
     )
@@ -1644,6 +2226,76 @@ Report bugs to: https://github.com/rom/sshcheck/issues
         metavar='FILE',
         help='Save scan progress to checkpoint file for resume support.'
     )
+    scan_group.add_argument(
+        '--spray',
+        action='store_true',
+        help=(
+            'Enable credential spray mode. Tries one password across all '
+            'users/hosts before moving to the next password. Helps avoid '
+            'account lockouts in enterprise environments.'
+        )
+    )
+
+    # Target exclusion
+    exclude_group = parser.add_argument_group('Target Exclusion')
+    exclude_group.add_argument(
+        '--exclude',
+        action='append',
+        dest='exclude_hosts',
+        metavar='HOST',
+        help=(
+            'Host(s) to exclude from scanning. Accepts: single IP, '
+            'CIDR range, IP range, or hostname. Can be specified multiple times.'
+        )
+    )
+    exclude_group.add_argument(
+        '--exclude-file',
+        metavar='FILE',
+        help=(
+            'File containing hosts to exclude (one per line). '
+            'Same format as target files.'
+        )
+    )
+
+    # Security features
+    security_group = parser.add_argument_group('Security Features')
+    security_group.add_argument(
+        '--detect-honeypot',
+        action='store_true',
+        help=(
+            'Enable honeypot detection. Analyzes SSH banners, response '
+            'patterns, and behavior for signs of SSH honeypots (Cowrie, Kippo, etc.).'
+        )
+    )
+    security_group.add_argument(
+        '--known-hosts',
+        metavar='FILE',
+        help=(
+            'Check host keys against a known hosts file for MITM detection. '
+            'Supports OpenSSH known_hosts format and sshcheck JSON format. '
+            'Discovered keys are saved back to this file after scanning.'
+        )
+    )
+    security_group.add_argument(
+        '--baseline',
+        metavar='FILE',
+        help=(
+            'Compare scan results against a previous scan baseline (JSON). '
+            'Reports new/removed hosts, changed credentials, host key changes, '
+            'and SSH version changes.'
+        )
+    )
+
+    # Nmap integration
+    nmap_group = parser.add_argument_group('Nmap Integration')
+    nmap_group.add_argument(
+        '--import-nmap',
+        metavar='FILE',
+        help=(
+            'Import targets from an Nmap XML output file. Extracts hosts '
+            'with open SSH ports. Can be combined with -t for additional targets.'
+        )
+    )
 
     # Performance options
     perf_group = parser.add_argument_group('Performance Options')
@@ -1703,6 +2355,12 @@ def apply_config(args: argparse.Namespace, config: dict):
         'max_attempts_per_user': ('max_attempts_per_user', int, 0),
         'command': ('command', str, None),
         'checkpoint': ('checkpoint', str, None),
+        'spray': ('spray', bool, False),
+        'exclude_hosts': ('exclude_hosts', list, None),
+        'detect_honeypot': ('detect_honeypot', bool, False),
+        'known_hosts': ('known_hosts', str, None),
+        'baseline': ('baseline', str, None),
+        'import_nmap': ('import_nmap', str, None),
     }
 
     for config_key, (attr_name, expected_type, default) in mapping.items():
@@ -1733,10 +2391,44 @@ def main():
             print(f"ERROR: Resume file not found: {args.resume}", file=sys.stderr)
             sys.exit(1)
 
+    # Import targets from Nmap XML if specified
+    nmap_targets = []
+    if hasattr(args, 'import_nmap') and args.import_nmap:
+        try:
+            nmap_results = SSHAuditClient.import_nmap_xml(args.import_nmap)
+            if nmap_results:
+                # Parse "host:port" format from nmap results
+                for hp in nmap_results:
+                    if ':' in hp:
+                        h, p = hp.rsplit(':', 1)
+                        nmap_targets.append(h)
+                        try:
+                            port_num = int(p)
+                            if not hasattr(args, 'ports') or args.ports is None:
+                                args.ports = []
+                            if port_num not in (args.ports or []):
+                                if args.ports is None:
+                                    args.ports = []
+                                args.ports.append(port_num)
+                        except ValueError:
+                            pass
+                    else:
+                        nmap_targets.append(hp)
+                print(f"Imported {len(nmap_results)} SSH targets from Nmap XML",
+                      file=sys.stderr if args.quiet else sys.stdout)
+            else:
+                print("WARNING: No SSH targets found in Nmap XML file.",
+                      file=sys.stderr)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Collect targets
     targets = []
     if args.targets:
         targets.extend(args.targets)
+    if nmap_targets:
+        targets.extend(nmap_targets)
     if args.target_file:
         try:
             client = SSHAuditClient()  # Temporary instance for file reading
@@ -1827,6 +2519,18 @@ def main():
     if not ports:
         ports = [22]  # Default SSH port
 
+    # Collect excluded hosts
+    exclude_hosts = []
+    if hasattr(args, 'exclude_hosts') and args.exclude_hosts:
+        exclude_hosts.extend(args.exclude_hosts)
+    if hasattr(args, 'exclude_file') and args.exclude_file:
+        try:
+            client = SSHAuditClient()
+            exclude_hosts.extend(client._read_file_lines(args.exclude_file, "exclude"))
+        except (FileNotFoundError, PermissionError, IOError) as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+
     # Validate thread count
     if args.threads < 1:
         print(
@@ -1875,6 +2579,11 @@ def main():
         max_attempts_per_user=args.max_attempts_per_user,
         command=args.command,
         checkpoint_file=checkpoint_file,
+        spray_mode=getattr(args, 'spray', False),
+        exclude_hosts=exclude_hosts if exclude_hosts else None,
+        detect_honeypot=getattr(args, 'detect_honeypot', False),
+        known_hosts_file=getattr(args, 'known_hosts', None),
+        baseline_file=getattr(args, 'baseline', None),
     )
 
     try:

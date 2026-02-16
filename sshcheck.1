@@ -1,6 +1,6 @@
 .\" Man page for sshcheck
 .\" Contact: rom@romab.com
-.TH SSHCHECK 1 "February 2026" "sshcheck 2.0.0" "Security Audit Tools"
+.TH SSHCHECK 1 "February 2026" "sshcheck 3.0.0" "Security Audit Tools"
 .SH NAME
 sshcheck \- SSH Security Audit Client for testing login capabilities
 .SH SYNOPSIS
@@ -13,6 +13,12 @@ sshcheck \- SSH Security Audit Client for testing login capabilities
 [\fB\-\-port\fR \fIPORT\fR | \fB\-\-port-file\fR \fIFILE\fR]
 [\fB\-c\fR \fICMD\fR]
 [\fB\-\-config\fR \fIFILE\fR]
+[\fB\-\-spray\fR]
+[\fB\-\-exclude\fR \fIHOST\fR | \fB\-\-exclude-file\fR \fIFILE\fR]
+[\fB\-\-detect\-honeypot\fR]
+[\fB\-\-known\-hosts\fR \fIFILE\fR]
+[\fB\-\-baseline\fR \fIFILE\fR]
+[\fB\-\-import\-nmap\fR \fIFILE\fR]
 [\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B sshcheck
@@ -128,6 +134,43 @@ during scanning and when the scan is interrupted with Ctrl+C.
 .BR \-\-resume " " \fIFILE\fR
 Resume a previously interrupted scan from a checkpoint file. Already completed
 attempts are skipped and previous results are restored.
+.TP
+.BR \-\-spray
+Enable credential spray mode. Tries one password across all users and hosts
+before moving to the next password. This helps avoid account lockouts in
+enterprise environments with lockout policies.
+.SS "Target Exclusion"
+.TP
+.BR \-\-exclude " " \fIHOST\fR
+Host(s) to exclude from scanning. Accepts the same formats as \fB-t\fR:
+single IP, CIDR range, IP range, or hostname. Can be specified multiple times.
+.TP
+.BR \-\-exclude\-file " " \fIFILE\fR
+File containing hosts to exclude, one per line. Same format as target files.
+.SS "Security Features"
+.TP
+.BR \-\-detect\-honeypot
+Enable honeypot detection. Analyzes SSH banners, response patterns, timing,
+and behavior for signs of SSH honeypots such as Cowrie and Kippo. Results
+include a honeypot score (0.0-1.0) and specific indicator reasons.
+.TP
+.BR \-\-known\-hosts " " \fIFILE\fR
+Check host keys against a known hosts file for MITM (Man-in-the-Middle)
+detection. Supports OpenSSH known_hosts format and sshcheck's own JSON
+format. Discovered host keys are saved back to this file after scanning
+for future comparison.
+.TP
+.BR \-\-baseline " " \fIFILE\fR
+Compare scan results against a previous scan baseline in JSON format.
+Reports new/removed hosts, changed credentials, host key changes, and
+SSH version changes. A diff file (.diff.json) is saved alongside the
+output file.
+.SS "Nmap Integration"
+.TP
+.BR \-\-import\-nmap " " \fIFILE\fR
+Import targets from an Nmap XML output file (\fB-oX\fR). Extracts hosts
+with open SSH ports (port 22, 2222, or any port with service name 'ssh').
+Can be combined with \fB-t\fR for additional targets.
 .SS "Performance Options"
 .TP
 .BR \-n ", " \-\-threads " " \fINUM\fR
@@ -158,6 +201,27 @@ MD5 and SHA-1 based MACs, DSA host keys, and weak Diffie-Hellman groups.
 SSH banners are parsed to identify the operating system (Ubuntu, Debian, FreeBSD,
 CentOS, Windows, etc.), OS family, and SSH software version. Known vulnerable
 OpenSSH versions are flagged with appropriate severity levels.
+.SS "Honeypot Detection"
+When enabled with \fB\-\-detect\-honeypot\fR, sshcheck analyzes connections for
+honeypot indicators: known Cowrie/Kippo banners, suspicious response patterns,
+default honeypot hostnames, unusually fast connections, and trivial credential
+acceptance. Each result receives a score from 0.0 to 1.0.
+.SS "Host Key Continuity"
+The \fB\-\-known\-hosts\fR option monitors host keys across scans to detect
+potential MITM attacks. Host key changes are flagged with CRITICAL severity.
+Supports both OpenSSH known_hosts format and sshcheck's JSON format.
+.SS "Baseline Comparison"
+The \fB\-\-baseline\fR option compares current results against a previous scan
+to identify: new/removed hosts, new/lost credentials, host key changes, and
+SSH version changes. This enables continuous security monitoring.
+.SS "Credential Spraying"
+The \fB\-\-spray\fR option changes the credential testing order to try one
+password across all users and hosts before moving to the next password. This
+avoids triggering account lockout policies in enterprise environments.
+.SS "Nmap Integration"
+The \fB\-\-import\-nmap\fR option reads Nmap XML output to automatically
+target only hosts with confirmed open SSH ports, integrating into existing
+network discovery workflows.
 .SS "Severity Scoring"
 Each finding is automatically assessed for severity:
 .TP
@@ -233,6 +297,24 @@ Scan with checkpoint and resume:
 .TP
 Use configuration file:
 .B sshcheck --config scan_profile.yaml
+.TP
+Credential spray mode:
+.B sshcheck -t 192.168.1.0/24 -U users.txt -P passwords.txt --spray -n 5
+.TP
+Scan with host exclusions:
+.B sshcheck -t 10.0.0.0/24 --exclude 10.0.0.1 --exclude 10.0.0.254 -u root -p pass
+.TP
+Import targets from Nmap and scan:
+.B sshcheck --import-nmap scan.xml -U users.txt -P passwords.txt
+.TP
+Honeypot detection:
+.B sshcheck -t 192.168.1.1 -u root -p pass --detect-honeypot
+.TP
+MITM detection with known hosts:
+.B sshcheck -t 192.168.1.0/24 -u root -p pass --known-hosts hosts.json
+.TP
+Baseline comparison:
+.B sshcheck -t 192.168.1.0/24 -u root -p pass --baseline prev_scan.json -o current.json -f json
 .SH ERROR MESSAGES
 .TP
 .B "Authentication failed"

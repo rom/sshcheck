@@ -28,6 +28,8 @@ from sshcheck import (
     WEAK_ALGORITHMS,
     OS_FINGERPRINTS,
     HONEYPOT_SIGNATURES,
+    COMMON_PASSWORDS,
+    COMMON_SSH_PORTS,
     parse_arguments,
     load_config_file,
     apply_config,
@@ -2392,6 +2394,811 @@ class TestBaselineDiffPrinting(unittest.TestCase):
         with patch('sys.stdout', new_callable=StringIO) as mock_out:
             client._print_baseline_diff(diff)
         self.assertEqual(mock_out.getvalue(), "")
+
+
+class TestPasswordStrengthScoring(unittest.TestCase):
+    """Test cases for password strength scoring."""
+
+    def test_empty_password(self):
+        """Test scoring an empty password."""
+        score, label = SSHAuditClient.score_password_strength("")
+        self.assertEqual(score, 0.0)
+        self.assertEqual(label, "empty")
+
+    def test_common_password(self):
+        """Test that common passwords get a low score."""
+        score, label = SSHAuditClient.score_password_strength("password")
+        self.assertLess(score, 30)
+        self.assertIn(label, ("very_weak", "weak"))
+
+    def test_common_password_123456(self):
+        """Test scoring of '123456'."""
+        score, label = SSHAuditClient.score_password_strength("123456")
+        self.assertLess(score, 30)
+
+    def test_strong_password(self):
+        """Test a strong password gets a high score."""
+        score, label = SSHAuditClient.score_password_strength("T#h1s!Is@Str0ng_P4ss")
+        self.assertGreater(score, 60)
+        self.assertIn(label, ("strong", "very_strong"))
+
+    def test_very_short_password(self):
+        """Test very short passwords get low scores."""
+        score, label = SSHAuditClient.score_password_strength("ab")
+        self.assertLess(score, 30)
+
+    def test_username_as_password_penalty(self):
+        """Test penalty when password matches username."""
+        # Use a non-common password to avoid common password penalty masking the difference
+        score_without, _ = SSHAuditClient.score_password_strength("jsmith2024")
+        score_with, _ = SSHAuditClient.score_password_strength("jsmith2024", username="jsmith2024")
+        self.assertLess(score_with, score_without)
+
+    def test_username_in_password_penalty(self):
+        """Test penalty when username is contained in password."""
+        score_without, _ = SSHAuditClient.score_password_strength("admin123")
+        score_with, _ = SSHAuditClient.score_password_strength("admin123", username="admin")
+        self.assertLess(score_with, score_without)
+
+    def test_character_diversity(self):
+        """Test that character diversity increases score."""
+        # All lowercase
+        score_low, _ = SSHAuditClient.score_password_strength("abcdefghij")
+        # Mixed: lower + upper + digits + special
+        score_high, _ = SSHAuditClient.score_password_strength("aB3$efghij")
+        self.assertGreater(score_high, score_low)
+
+    def test_sequential_characters_penalty(self):
+        """Test penalty for sequential characters."""
+        score_seq, _ = SSHAuditClient.score_password_strength("abcdefghij")
+        score_non, _ = SSHAuditClient.score_password_strength("axbzeyghwj")
+        self.assertLess(score_seq, score_non)
+
+    def test_repeated_characters_penalty(self):
+        """Test penalty for repeated characters."""
+        score_rep, _ = SSHAuditClient.score_password_strength("aaabbbccc")
+        score_non, _ = SSHAuditClient.score_password_strength("axbyczdwe")
+        self.assertLess(score_rep, score_non)
+
+    def test_long_complex_password(self):
+        """Test a long complex password gets very strong."""
+        score, label = SSHAuditClient.score_password_strength(
+            "K9$mL2#xPq4!vN7&jR5@wT8"
+        )
+        self.assertGreater(score, 70)
+        self.assertIn(label, ("strong", "very_strong"))
+
+    def test_score_bounded(self):
+        """Test that score is always between 0 and 100."""
+        test_passwords = ["", "a", "password", "P@$$w0rd!2024LongOne"]
+        for pw in test_passwords:
+            score, _ = SSHAuditClient.score_password_strength(pw)
+            self.assertGreaterEqual(score, 0.0)
+            self.assertLessEqual(score, 100.0)
+
+    def test_label_values(self):
+        """Test that labels are from the expected set."""
+        valid_labels = {"empty", "very_weak", "weak", "moderate", "strong", "very_strong"}
+        test_passwords = [
+            "", "a", "123456", "password1", "Str0ng!Pass",
+            "K9$mL2#xPq4!vN7&jR5@wT8"
+        ]
+        for pw in test_passwords:
+            _, label = SSHAuditClient.score_password_strength(pw)
+            self.assertIn(label, valid_labels)
+
+    def test_score_password_in_scan_result(self):
+        """Test that password strength is added to scan results."""
+        client = SSHAuditClient(score_passwords=True)
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="admin",
+            password="password123", success=True,
+            timestamp="2026-01-01T12:00:00"
+        )
+        # Simulate the scoring that happens in _try_login
+        pw_score, pw_label = SSHAuditClient.score_password_strength(
+            result.password, result.username
+        )
+        result.password_strength_score = pw_score
+        result.password_strength_label = pw_label
+        self.assertGreater(result.password_strength_score, 0)
+        self.assertIn(result.password_strength_label, {"very_weak", "weak", "moderate", "strong", "very_strong"})
+
+    def test_common_passwords_set(self):
+        """Test that COMMON_PASSWORDS contains expected entries."""
+        self.assertIn("password", COMMON_PASSWORDS)
+        self.assertIn("123456", COMMON_PASSWORDS)
+        self.assertIn("admin", COMMON_PASSWORDS)
+        self.assertIn("root", COMMON_PASSWORDS)
+
+
+class TestSourceIPBinding(unittest.TestCase):
+    """Test cases for source IP binding."""
+
+    def test_source_ip_init(self):
+        """Test that source_ip is stored in client."""
+        client = SSHAuditClient(source_ip="192.168.1.100")
+        self.assertEqual(client.source_ip, "192.168.1.100")
+
+    def test_source_ip_default_none(self):
+        """Test that source_ip defaults to None."""
+        client = SSHAuditClient()
+        self.assertIsNone(client.source_ip)
+
+    def test_source_ip_argument_parsing(self):
+        """Test --source-ip argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '10.0.0.1', '-u', 'root',
+                                '-p', 'pass', '--source-ip', '192.168.1.5']):
+            args = parse_arguments()
+            self.assertEqual(args.source_ip, '192.168.1.5')
+
+    def test_source_ip_config(self):
+        """Test source_ip from config file."""
+        import argparse
+        args = argparse.Namespace(
+            targets=None, target_file=None, users=None, user_file=None,
+            passwords=None, password_file=None, ports=None, port_file=None,
+            output=None, format='text', verbose=False, quiet=False,
+            threads=1, timeout=10, try_empty=False, user_as_pass=False,
+            stop_on_success=False, max_attempts_per_user=0, command=None,
+            checkpoint=None, spray=False, exclude_hosts=None,
+            detect_honeypot=False, known_hosts=None, baseline=None,
+            import_nmap=None, source_ip=None, jitter=0.0,
+            score_passwords=False, diff_mode=False, scan_ports=False,
+            discovery_ports=None,
+        )
+        config = {'source_ip': '10.0.0.5'}
+        apply_config(args, config)
+        self.assertEqual(args.source_ip, '10.0.0.5')
+
+    @patch('socket.socket')
+    def test_banner_with_source_ip(self, mock_socket_cls):
+        """Test that _get_ssh_banner binds to source IP."""
+        mock_sock = MagicMock()
+        mock_socket_cls.return_value = mock_sock
+        mock_sock.recv.return_value = b"SSH-2.0-OpenSSH_8.9"
+
+        client = SSHAuditClient(source_ip="192.168.1.100")
+        banner = client._get_ssh_banner("10.0.0.1", 22)
+
+        mock_sock.bind.assert_called_once_with(("192.168.1.100", 0))
+        self.assertEqual(banner, "SSH-2.0-OpenSSH_8.9")
+
+    @patch('socket.socket')
+    def test_banner_without_source_ip(self, mock_socket_cls):
+        """Test that _get_ssh_banner does not bind without source IP."""
+        mock_sock = MagicMock()
+        mock_socket_cls.return_value = mock_sock
+        mock_sock.recv.return_value = b"SSH-2.0-OpenSSH_8.9"
+
+        client = SSHAuditClient()
+        banner = client._get_ssh_banner("10.0.0.1", 22)
+
+        mock_sock.bind.assert_not_called()
+
+
+class TestJitter(unittest.TestCase):
+    """Test cases for jitter/randomization."""
+
+    def test_jitter_init(self):
+        """Test that jitter is stored in client."""
+        client = SSHAuditClient(jitter=2.5)
+        self.assertEqual(client.jitter, 2.5)
+
+    def test_jitter_default_zero(self):
+        """Test that jitter defaults to 0."""
+        client = SSHAuditClient()
+        self.assertEqual(client.jitter, 0.0)
+
+    def test_jitter_argument_parsing(self):
+        """Test --jitter argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '10.0.0.1', '-u', 'root',
+                                '-p', 'pass', '--jitter', '1.5']):
+            args = parse_arguments()
+            self.assertEqual(args.jitter, 1.5)
+
+    def test_jitter_argument_default(self):
+        """Test --jitter default is 0."""
+        with patch('sys.argv', ['sshcheck', '-t', '10.0.0.1', '-u', 'root',
+                                '-p', 'pass']):
+            args = parse_arguments()
+            self.assertEqual(args.jitter, 0.0)
+
+    def test_jitter_config(self):
+        """Test jitter from config file."""
+        import argparse
+        args = argparse.Namespace(
+            targets=None, target_file=None, users=None, user_file=None,
+            passwords=None, password_file=None, ports=None, port_file=None,
+            output=None, format='text', verbose=False, quiet=False,
+            threads=1, timeout=10, try_empty=False, user_as_pass=False,
+            stop_on_success=False, max_attempts_per_user=0, command=None,
+            checkpoint=None, spray=False, exclude_hosts=None,
+            detect_honeypot=False, known_hosts=None, baseline=None,
+            import_nmap=None, source_ip=None, jitter=0.0,
+            score_passwords=False, diff_mode=False, scan_ports=False,
+            discovery_ports=None,
+        )
+        config = {'jitter': 3.0}
+        apply_config(args, config)
+        self.assertEqual(args.jitter, 3.0)
+
+    @patch('time.sleep')
+    @patch('random.uniform')
+    def test_jitter_delay_applied(self, mock_uniform, mock_sleep):
+        """Test that jitter delay is applied between scan attempts."""
+        mock_uniform.return_value = 0.5
+        client = SSHAuditClient(jitter=2.0, quiet=True)
+
+        # Mock _try_login to return quickly
+        mock_result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="pass", success=False,
+            timestamp="2026-01-01T12:00:00",
+            error_message="Auth failed"
+        )
+        mock_result.severity = "info"
+        mock_result.severity_reasons = ["No findings"]
+
+        with patch.object(client, '_try_login', return_value=mock_result):
+            client.scan(
+                targets=["10.0.0.1"],
+                usernames=["root"],
+                passwords=["pass1", "pass2"],
+                ports=[22]
+            )
+        # Jitter sleep should have been called at least once (between attempts)
+        self.assertTrue(mock_sleep.called)
+
+
+class TestServiceDiscovery(unittest.TestCase):
+    """Test cases for Nmap-style service discovery."""
+
+    @patch('socket.socket')
+    def test_discover_ssh_ports_found(self, mock_socket_cls):
+        """Test discovering an SSH port."""
+        # Create separate mock sockets for each port attempt
+        mock_sock_ssh = MagicMock()
+        mock_sock_ssh.connect_ex.return_value = 0
+        mock_sock_ssh.recv.return_value = b"SSH-2.0-OpenSSH_8.9p1"
+
+        mock_sock_http = MagicMock()
+        mock_sock_http.connect_ex.return_value = 0
+        mock_sock_http.recv.return_value = b"HTTP/1.1 200 OK\r\n"
+
+        mock_socket_cls.side_effect = [mock_sock_ssh, mock_sock_http]
+
+        found = SSHAuditClient.discover_ssh_ports("10.0.0.1", ports=[22, 80])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][0], 22)
+        self.assertIn("SSH-2.0", found[0][1])
+
+    @patch('socket.socket')
+    def test_discover_ssh_ports_not_found(self, mock_socket_cls):
+        """Test when no SSH ports are found."""
+        mock_sock = MagicMock()
+        mock_socket_cls.return_value = mock_sock
+        mock_sock.connect_ex.return_value = 1  # Connection refused
+
+        found = SSHAuditClient.discover_ssh_ports("10.0.0.1", ports=[22, 80])
+        self.assertEqual(len(found), 0)
+
+    @patch('socket.socket')
+    def test_discover_ssh_ports_non_ssh_service(self, mock_socket_cls):
+        """Test that non-SSH services are filtered out."""
+        mock_sock = MagicMock()
+        mock_socket_cls.return_value = mock_sock
+        mock_sock.connect_ex.return_value = 0
+        mock_sock.recv.return_value = b"HTTP/1.1 200 OK\r\n"
+
+        found = SSHAuditClient.discover_ssh_ports("10.0.0.1", ports=[80])
+        self.assertEqual(len(found), 0)
+
+    @patch('socket.socket')
+    def test_discover_ssh_ports_with_source_ip(self, mock_socket_cls):
+        """Test service discovery with source IP binding."""
+        mock_sock = MagicMock()
+        mock_socket_cls.return_value = mock_sock
+        mock_sock.connect_ex.return_value = 0
+        mock_sock.recv.return_value = b"SSH-2.0-OpenSSH_8.9"
+
+        found = SSHAuditClient.discover_ssh_ports(
+            "10.0.0.1", ports=[22], source_ip="192.168.1.5"
+        )
+        mock_sock.bind.assert_called_with(("192.168.1.5", 0))
+        self.assertEqual(len(found), 1)
+
+    @patch('socket.socket')
+    def test_discover_ssh_default_ports(self, mock_socket_cls):
+        """Test that default ports include common SSH ports."""
+        mock_sock = MagicMock()
+        mock_socket_cls.return_value = mock_sock
+        mock_sock.connect_ex.return_value = 1  # All closed
+
+        SSHAuditClient.discover_ssh_ports("10.0.0.1")
+        # Should have tried all COMMON_SSH_PORTS
+        self.assertEqual(mock_sock.connect_ex.call_count, len(COMMON_SSH_PORTS))
+
+    @patch('socket.socket')
+    def test_discover_ssh_timeout_handling(self, mock_socket_cls):
+        """Test that connection timeouts are handled gracefully."""
+        mock_sock = MagicMock()
+        mock_socket_cls.return_value = mock_sock
+        import socket
+        mock_sock.connect_ex.side_effect = socket.timeout("timed out")
+
+        # Should not raise
+        found = SSHAuditClient.discover_ssh_ports("10.0.0.1", ports=[22])
+        self.assertEqual(len(found), 0)
+
+    def test_scan_ports_argument_parsing(self):
+        """Test --scan-ports argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '10.0.0.1', '-u', 'root',
+                                '-p', 'pass', '--scan-ports']):
+            args = parse_arguments()
+            self.assertTrue(args.scan_ports)
+
+    def test_discovery_ports_argument_parsing(self):
+        """Test --discovery-ports argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '10.0.0.1', '-u', 'root',
+                                '-p', 'pass', '--scan-ports',
+                                '--discovery-ports', '22,2222,8022']):
+            args = parse_arguments()
+            self.assertEqual(args.discovery_ports, '22,2222,8022')
+
+    def test_common_ssh_ports_list(self):
+        """Test that COMMON_SSH_PORTS contains expected ports."""
+        self.assertIn(22, COMMON_SSH_PORTS)
+        self.assertIn(2222, COMMON_SSH_PORTS)
+        self.assertIn(22222, COMMON_SSH_PORTS)
+        self.assertIn(8022, COMMON_SSH_PORTS)
+
+
+class TestDiffMode(unittest.TestCase):
+    """Test cases for differential/delta output."""
+
+    def test_diff_mode_init(self):
+        """Test that diff_mode is stored in client."""
+        client = SSHAuditClient(diff_mode=True)
+        self.assertTrue(client.diff_mode)
+
+    def test_diff_mode_default_false(self):
+        """Test that diff_mode defaults to False."""
+        client = SSHAuditClient()
+        self.assertFalse(client.diff_mode)
+
+    def test_diff_argument_parsing(self):
+        """Test --diff argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '10.0.0.1', '-u', 'root',
+                                '-p', 'pass', '--diff', '--baseline', 'prev.json']):
+            args = parse_arguments()
+            self.assertTrue(args.diff_mode)
+
+    def test_save_diff_json(self):
+        """Test saving diff output as JSON."""
+        client = SSHAuditClient(diff_mode=True)
+        diff = {
+            'new_hosts': [{'host': '10.0.0.5', 'port': 22}],
+            'removed_hosts': [],
+            'new_credentials': [
+                {'host': '10.0.0.1', 'port': 22, 'username': 'root', 'password': 'toor'}
+            ],
+            'lost_credentials': [],
+            'host_key_changes': [],
+            'ssh_version_changes': [],
+            'summary': {
+                'new_hosts_count': 1, 'removed_hosts_count': 0,
+                'new_credentials_count': 1, 'lost_credentials_count': 0,
+                'host_key_changes_count': 0, 'ssh_version_changes_count': 0,
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_diff_output(diff, Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                saved = json.load(f)
+            self.assertEqual(saved['changes']['new_hosts'][0]['host'], '10.0.0.5')
+            self.assertEqual(saved['changes']['new_credentials'][0]['username'], 'root')
+            self.assertIn('scan_info', saved)
+            self.assertEqual(saved['scan_info']['mode'], 'differential')
+        finally:
+            os.unlink(tmp_path)
+
+    def test_save_diff_csv(self):
+        """Test saving diff output as CSV."""
+        client = SSHAuditClient(diff_mode=True)
+        diff = {
+            'new_hosts': [{'host': '10.0.0.5', 'port': 22}],
+            'removed_hosts': [{'host': '10.0.0.3', 'port': 22}],
+            'new_credentials': [],
+            'lost_credentials': [],
+            'host_key_changes': [],
+            'ssh_version_changes': [],
+            'summary': {
+                'new_hosts_count': 1, 'removed_hosts_count': 1,
+                'new_credentials_count': 0, 'lost_credentials_count': 0,
+                'host_key_changes_count': 0, 'ssh_version_changes_count': 0,
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_diff_output(diff, Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('new_host', content)
+            self.assertIn('removed_host', content)
+            self.assertIn('10.0.0.5', content)
+            self.assertIn('10.0.0.3', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_save_diff_text(self):
+        """Test saving diff output as text."""
+        client = SSHAuditClient(diff_mode=True)
+        diff = {
+            'new_hosts': [{'host': '10.0.0.5', 'port': 22}],
+            'removed_hosts': [],
+            'new_credentials': [
+                {'host': '10.0.0.1', 'port': 22, 'username': 'admin', 'password': 'pass'}
+            ],
+            'lost_credentials': [],
+            'host_key_changes': [],
+            'ssh_version_changes': [
+                {'host': '10.0.0.1', 'port': 22,
+                 'previous_version': 'OpenSSH_7.9', 'current_version': 'OpenSSH_8.9'}
+            ],
+            'summary': {
+                'new_hosts_count': 1, 'removed_hosts_count': 0,
+                'new_credentials_count': 1, 'lost_credentials_count': 0,
+                'host_key_changes_count': 0, 'ssh_version_changes_count': 1,
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_diff_output(diff, Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('NEW HOSTS', content)
+            self.assertIn('10.0.0.5', content)
+            self.assertIn('NEW CREDENTIALS', content)
+            self.assertIn('SSH VERSION CHANGES', content)
+            self.assertIn('Differential', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_save_diff_no_changes(self):
+        """Test saving diff output with no changes."""
+        client = SSHAuditClient(diff_mode=True)
+        diff = {
+            'new_hosts': [], 'removed_hosts': [],
+            'new_credentials': [], 'lost_credentials': [],
+            'host_key_changes': [], 'ssh_version_changes': [],
+            'summary': {
+                'new_hosts_count': 0, 'removed_hosts_count': 0,
+                'new_credentials_count': 0, 'lost_credentials_count': 0,
+                'host_key_changes_count': 0, 'ssh_version_changes_count': 0,
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_diff_output(diff, Path(tmp_path))
+            with open(tmp_path, 'r') as f:
+                content = f.read()
+            self.assertIn('No changes detected', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_diff_config(self):
+        """Test diff_mode from config file."""
+        import argparse
+        args = argparse.Namespace(
+            targets=None, target_file=None, users=None, user_file=None,
+            passwords=None, password_file=None, ports=None, port_file=None,
+            output=None, format='text', verbose=False, quiet=False,
+            threads=1, timeout=10, try_empty=False, user_as_pass=False,
+            stop_on_success=False, max_attempts_per_user=0, command=None,
+            checkpoint=None, spray=False, exclude_hosts=None,
+            detect_honeypot=False, known_hosts=None, baseline=None,
+            import_nmap=None, source_ip=None, jitter=0.0,
+            score_passwords=False, diff_mode=False, scan_ports=False,
+            discovery_ports=None,
+        )
+        config = {'diff_mode': True}
+        apply_config(args, config)
+        self.assertTrue(args.diff_mode)
+
+
+class TestPDFReport(unittest.TestCase):
+    """Test cases for PDF report generation."""
+
+    def test_pdf_format_argument(self):
+        """Test --format pdf argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '10.0.0.1', '-u', 'root',
+                                '-p', 'pass', '-f', 'pdf', '-o', 'report.pdf']):
+            args = parse_arguments()
+            self.assertEqual(args.format, 'pdf')
+
+    def test_save_pdf_creates_file(self):
+        """Test that _save_pdf creates a valid PDF file."""
+        client = SSHAuditClient()
+        client.stats.start_time = None
+        client.stats.end_time = None
+        client.results = []
+
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_pdf(Path(tmp_path))
+            self.assertTrue(os.path.exists(tmp_path))
+            with open(tmp_path, 'rb') as f:
+                content = f.read()
+            # Verify it starts with PDF header
+            self.assertTrue(content.startswith(b'%PDF-1.4'))
+            # Verify it ends with %%EOF
+            self.assertTrue(content.rstrip().endswith(b'%%EOF'))
+        finally:
+            os.unlink(tmp_path)
+
+    def test_save_pdf_with_results(self):
+        """Test PDF generation with scan results."""
+        from datetime import datetime
+        client = SSHAuditClient()
+        client.stats.start_time = datetime(2026, 1, 1, 12, 0, 0)
+        client.stats.end_time = datetime(2026, 1, 1, 12, 5, 0)
+        client.stats.total_attempts = 5
+        client.stats.successful_logins = 2
+        client.stats.failed_logins = 3
+        client.results = [
+            ScanResult(
+                host="10.0.0.1", port=22, username="root",
+                password="toor", success=True,
+                timestamp="2026-01-01T12:00:00",
+                banner="SSH-2.0-OpenSSH_8.9",
+                severity="critical",
+                severity_reasons=["Root login with password"],
+                os_info="Ubuntu Linux",
+                os_family="Linux",
+                ssh_version="OpenSSH_8.9",
+                host_key_type="ssh-ed25519",
+                host_key_fingerprint="SHA256:abc123",
+                host_key_bits=256,
+            ),
+            ScanResult(
+                host="10.0.0.1", port=22, username="admin",
+                password="wrong", success=False,
+                timestamp="2026-01-01T12:01:00",
+                error_message="Auth failed",
+                severity="info",
+            ),
+        ]
+
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_pdf(Path(tmp_path))
+            self.assertTrue(os.path.exists(tmp_path))
+            with open(tmp_path, 'rb') as f:
+                content = f.read()
+            self.assertTrue(content.startswith(b'%PDF-1.4'))
+            # Should contain page objects
+            self.assertIn(b'/Type /Page', content)
+            self.assertIn(b'/Type /Catalog', content)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_save_pdf_special_characters(self):
+        """Test PDF generation with special characters in data."""
+        client = SSHAuditClient()
+        client.stats.start_time = None
+        client.stats.end_time = None
+        client.results = [
+            ScanResult(
+                host="10.0.0.1", port=22, username="root",
+                password="p@ss(word)", success=True,
+                timestamp="2026-01-01T12:00:00",
+                severity="high",
+                severity_reasons=["Login successful"],
+                banner="SSH-2.0-OpenSSH_8.9 (test)",
+            ),
+        ]
+
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_pdf(Path(tmp_path))
+            with open(tmp_path, 'rb') as f:
+                content = f.read()
+            self.assertTrue(content.startswith(b'%PDF-1.4'))
+        finally:
+            os.unlink(tmp_path)
+
+    def test_save_pdf_many_results(self):
+        """Test PDF generation with many results (multi-page)."""
+        client = SSHAuditClient()
+        client.stats.start_time = None
+        client.stats.end_time = None
+        client.results = [
+            ScanResult(
+                host=f"10.0.0.{i}", port=22, username="root",
+                password=f"pass{i}", success=(i % 3 == 0),
+                timestamp="2026-01-01T12:00:00",
+                severity="info",
+            )
+            for i in range(100)
+        ]
+
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+            tmp_path = f.name
+        try:
+            client._save_pdf(Path(tmp_path))
+            with open(tmp_path, 'rb') as f:
+                content = f.read()
+            self.assertTrue(content.startswith(b'%PDF-1.4'))
+            # Should have multiple pages
+            page_count = content.count(b'/Type /Page')
+            self.assertGreater(page_count, 1)
+        finally:
+            os.unlink(tmp_path)
+
+
+class TestScanResultNewFieldsV4(unittest.TestCase):
+    """Test new ScanResult fields for v4.0."""
+
+    def test_password_strength_defaults(self):
+        """Test default values for password strength fields."""
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="pass", success=True,
+            timestamp="2026-01-01T12:00:00"
+        )
+        self.assertEqual(result.password_strength_score, 0.0)
+        self.assertEqual(result.password_strength_label, "")
+
+    def test_password_strength_to_dict(self):
+        """Test that password strength fields appear in to_dict."""
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="pass", success=True,
+            timestamp="2026-01-01T12:00:00",
+            password_strength_score=45.5,
+            password_strength_label="moderate",
+        )
+        d = result.to_dict()
+        self.assertEqual(d['password_strength_score'], 45.5)
+        self.assertEqual(d['password_strength_label'], 'moderate')
+
+
+class TestNewArgumentDefaultsV4(unittest.TestCase):
+    """Test argument defaults for v4 features."""
+
+    def test_all_new_defaults(self):
+        """Test default values for all new v4 arguments."""
+        with patch('sys.argv', ['sshcheck', '-t', '10.0.0.1',
+                                '-u', 'root', '-p', 'pass']):
+            args = parse_arguments()
+            self.assertIsNone(args.source_ip)
+            self.assertEqual(args.jitter, 0.0)
+            self.assertFalse(args.score_passwords)
+            self.assertFalse(args.diff_mode)
+            self.assertFalse(args.scan_ports)
+            self.assertIsNone(args.discovery_ports)
+
+    def test_pdf_format_in_choices(self):
+        """Test that pdf is a valid format choice."""
+        with patch('sys.argv', ['sshcheck', '-t', '10.0.0.1',
+                                '-u', 'root', '-p', 'pass',
+                                '-f', 'pdf']):
+            args = parse_arguments()
+            self.assertEqual(args.format, 'pdf')
+
+
+class TestConfigNewOptionsV4(unittest.TestCase):
+    """Test config file support for v4 options."""
+
+    def test_apply_config_all_v4_options(self):
+        """Test applying all v4 config options."""
+        import argparse
+        args = argparse.Namespace(
+            targets=None, target_file=None, users=None, user_file=None,
+            passwords=None, password_file=None, ports=None, port_file=None,
+            output=None, format='text', verbose=False, quiet=False,
+            threads=1, timeout=10, try_empty=False, user_as_pass=False,
+            stop_on_success=False, max_attempts_per_user=0, command=None,
+            checkpoint=None, spray=False, exclude_hosts=None,
+            detect_honeypot=False, known_hosts=None, baseline=None,
+            import_nmap=None, source_ip=None, jitter=0.0,
+            score_passwords=False, diff_mode=False, scan_ports=False,
+            discovery_ports=None,
+        )
+        config = {
+            'source_ip': '192.168.1.100',
+            'jitter': 1.5,
+            'score_passwords': True,
+            'diff_mode': True,
+            'scan_ports': True,
+            'discovery_ports': '22,2222',
+        }
+        apply_config(args, config)
+        self.assertEqual(args.source_ip, '192.168.1.100')
+        self.assertEqual(args.jitter, 1.5)
+        self.assertTrue(args.score_passwords)
+        self.assertTrue(args.diff_mode)
+        self.assertTrue(args.scan_ports)
+        self.assertEqual(args.discovery_ports, '22,2222')
+
+
+class TestVersionUpdate(unittest.TestCase):
+    """Test version update."""
+
+    def test_version_is_4(self):
+        """Test that version is 4.0.0."""
+        self.assertEqual(__version__, "4.0.0")
+
+
+class TestPasswordStrengthInProgress(unittest.TestCase):
+    """Test password strength display in progress output."""
+
+    def test_progress_shows_password_strength(self):
+        """Test that password strength is shown in progress output."""
+        client = SSHAuditClient(score_passwords=True)
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="weak", success=True,
+            timestamp="2026-01-01T12:00:00",
+            severity="critical",
+            severity_reasons=["Root login"],
+            password_strength_score=15.0,
+            password_strength_label="very_weak",
+        )
+        with patch('sys.stdout', new_callable=StringIO) as mock_out:
+            client._print_progress(result, 1, 1)
+        output = mock_out.getvalue()
+        self.assertIn("VERY_WEAK", output)
+        self.assertIn("Password Strength", output)
+
+    def test_progress_no_password_strength_when_not_scoring(self):
+        """Test that password strength is not shown when scoring disabled."""
+        client = SSHAuditClient(score_passwords=False)
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="weak", success=True,
+            timestamp="2026-01-01T12:00:00",
+            severity="critical",
+            severity_reasons=["Root login"],
+        )
+        with patch('sys.stdout', new_callable=StringIO) as mock_out:
+            client._print_progress(result, 1, 1)
+        output = mock_out.getvalue()
+        self.assertNotIn("Password Strength", output)
+
+
+class TestSaveResultsPDF(unittest.TestCase):
+    """Test _save_results routing to PDF."""
+
+    def test_save_results_routes_to_pdf(self):
+        """Test that format=pdf routes to _save_pdf."""
+        from datetime import datetime
+        client = SSHAuditClient(
+            output_format='pdf',
+            output_file='/tmp/test_sshcheck_pdf_route.pdf'
+        )
+        client.stats.start_time = datetime(2026, 1, 1)
+        client.stats.end_time = datetime(2026, 1, 1)
+        client.results = []
+
+        with patch.object(client, '_save_pdf') as mock_pdf:
+            client._save_results()
+            mock_pdf.assert_called_once()
+
+        # Cleanup
+        try:
+            os.unlink('/tmp/test_sshcheck_pdf_route.pdf')
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == '__main__':

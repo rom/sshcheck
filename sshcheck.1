@@ -1,6 +1,6 @@
 .\" Man page for sshcheck
 .\" Contact: rom@romab.com
-.TH SSHCHECK 1 "February 2026" "sshcheck 3.0.0" "Security Audit Tools"
+.TH SSHCHECK 1 "February 2026" "sshcheck 4.0.0" "Security Audit Tools"
 .SH NAME
 sshcheck \- SSH Security Audit Client for testing login capabilities
 .SH SYNOPSIS
@@ -19,6 +19,11 @@ sshcheck \- SSH Security Audit Client for testing login capabilities
 [\fB\-\-known\-hosts\fR \fIFILE\fR]
 [\fB\-\-baseline\fR \fIFILE\fR]
 [\fB\-\-import\-nmap\fR \fIFILE\fR]
+[\fB\-\-source\-ip\fR \fIIP\fR]
+[\fB\-\-jitter\fR \fISECONDS\fR]
+[\fB\-\-scan\-ports\fR]
+[\fB\-\-score\-passwords\fR]
+[\fB\-\-diff\fR]
 [\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B sshcheck
@@ -104,6 +109,8 @@ Comma-separated values for spreadsheet import
 Structured XML format for tool integration
 .IP \fBhtml\fR
 Styled HTML report with summary cards, severity badges, and color coding
+.IP \fBpdf\fR
+PDF report with scan statistics, successful logins, and all results (no external dependencies)
 .RE
 .TP
 .BR \-v ", " \-\-verbose
@@ -171,6 +178,33 @@ output file.
 Import targets from an Nmap XML output file (\fB-oX\fR). Extracts hosts
 with open SSH ports (port 22, 2222, or any port with service name 'ssh').
 Can be combined with \fB-t\fR for additional targets.
+.SS "Network Options"
+.TP
+.BR \-\-source\-ip " " \fIIP\fR
+Bind to a specific source IP address for outgoing connections.
+Useful for testing from different network interfaces or VLANs.
+.SS "Service Discovery"
+.TP
+.BR \-\-scan\-ports
+Discover SSH services before scanning. Performs a TCP connect scan
+on common SSH ports (22, 2222, 2200, etc.) to find SSH services.
+Discovered ports are added to the scan target list.
+.TP
+.BR \-\-discovery\-ports " " \fIPORTS\fR
+Comma-separated list of ports to check during service discovery.
+Default: 22,2222,2200,22222,8022,830,222,2022,2220,10022
+.SS "Differential Output"
+.TP
+.BR \-\-diff
+Enable differential/delta output mode. When used with \fB\-\-baseline\fR,
+the output file contains only changes between scans instead of the full report.
+Supports JSON, CSV, and text output formats.
+.SS "Password Analysis"
+.TP
+.BR \-\-score\-passwords
+Score password strength for successful logins. Evaluates length, character
+diversity, common patterns, and entropy. Reports a 0-100 score with labels
+(very_weak, weak, moderate, strong, very_strong).
 .SS "Performance Options"
 .TP
 .BR \-n ", " \-\-threads " " \fINUM\fR
@@ -181,6 +215,10 @@ Recommended range: 1-50.
 .BR \-\-timeout " " \fISECONDS\fR
 Connection timeout in seconds. Default is 10 seconds.
 Increase for slow networks or decrease for faster scanning.
+.TP
+.BR \-\-jitter " " \fISECONDS\fR
+Add random delay (0 to SECONDS) between connection attempts.
+Helps avoid rate limiting and IDS detection. Default: 0 (no jitter).
 .SS "Other Options"
 .TP
 .BR \-V ", " \-\-version
@@ -222,6 +260,27 @@ avoids triggering account lockout policies in enterprise environments.
 The \fB\-\-import\-nmap\fR option reads Nmap XML output to automatically
 target only hosts with confirmed open SSH ports, integrating into existing
 network discovery workflows.
+.SS "Source IP Binding"
+The \fB\-\-source\-ip\fR option binds all outgoing connections to a specific
+local IP address, useful for multi-homed machines or testing from specific VLANs.
+.SS "Jitter/Randomization"
+The \fB\-\-jitter\fR option adds random delay between attempts to avoid
+IDS detection and rate limiting. The delay is uniformly distributed between
+0 and the specified number of seconds.
+.SS "Password Strength Scoring"
+When \fB\-\-score\-passwords\fR is enabled, each successful login receives
+a password strength score (0-100) based on length, character diversity,
+entropy, common password lists, and pattern analysis.
+.SS "Service Discovery"
+The \fB\-\-scan\-ports\fR option performs TCP connect scanning on common SSH
+ports before the main credential scan, automatically adding discovered SSH
+services to the target list.
+.SS "Differential Output"
+The \fB\-\-diff\fR option (used with \fB\-\-baseline\fR) outputs only changes
+between scans instead of full reports, ideal for monitoring pipelines.
+.SS "PDF Reports"
+The \fB\-f pdf\fR option generates self-contained PDF security audit reports
+with no external Python dependencies.
 .SS "Severity Scoring"
 Each finding is automatically assessed for severity:
 .TP
@@ -315,6 +374,21 @@ MITM detection with known hosts:
 .TP
 Baseline comparison:
 .B sshcheck -t 192.168.1.0/24 -u root -p pass --baseline prev_scan.json -o current.json -f json
+.TP
+Scan with source IP binding:
+.B sshcheck -t 192.168.1.0/24 -u root -p pass --source-ip 10.0.0.5
+.TP
+Jitter between attempts:
+.B sshcheck -t 192.168.1.0/24 -U users.txt -P passwords.txt --jitter 2.0
+.TP
+Password strength scoring with PDF report:
+.B sshcheck -t 192.168.1.0/24 -U users.txt -P passwords.txt --score-passwords -f pdf -o report.pdf
+.TP
+SSH port discovery before scanning:
+.B sshcheck -t 192.168.1.0/24 --scan-ports -U users.txt -P passwords.txt
+.TP
+Differential output (changes only):
+.B sshcheck -t 192.168.1.0/24 -u root -p pass --baseline prev.json --diff -o changes.json -f json
 .SH ERROR MESSAGES
 .TP
 .B "Authentication failed"

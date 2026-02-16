@@ -16,10 +16,13 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import random
 import re
 import socket
+import string
+import struct
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -46,7 +49,7 @@ except ImportError:
 
 
 # Version information
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 __program_name__ = "sshcheck"
 
 
@@ -146,6 +149,20 @@ HONEYPOT_SIGNATURES = {
     ],
 }
 
+# Common passwords for password strength scoring
+COMMON_PASSWORDS = {
+    "password", "123456", "12345678", "qwerty", "abc123", "monkey", "1234567",
+    "letmein", "trustno1", "dragon", "baseball", "iloveyou", "master", "sunshine",
+    "ashley", "bailey", "passw0rd", "shadow", "123123", "654321", "superman",
+    "qazwsx", "michael", "football", "password1", "password123", "welcome",
+    "admin", "root", "toor", "changeme", "default", "test", "guest", "oracle",
+    "mysql", "sysadmin", "login", "pass", "p@ssw0rd", "p@ssword", "secret",
+    "access", "temp", "abcd1234", "alpine", "raspberry", "ubnt", "vagrant",
+}
+
+# Common SSH service ports for service discovery
+COMMON_SSH_PORTS = [22, 2222, 2200, 22222, 8022, 830, 222, 2022, 2220, 10022]
+
 
 @dataclass
 class ScanResult:
@@ -175,6 +192,8 @@ class ScanResult:
     honeypot_reasons: Optional[List[str]] = None
     host_key_changed: bool = False
     host_key_previous: str = ""
+    password_strength_score: float = 0.0
+    password_strength_label: str = ""
 
     def to_dict(self) -> dict:
         """Convert result to dictionary."""
@@ -243,6 +262,10 @@ class SSHAuditClient:
         detect_honeypot: bool = False,
         known_hosts_file: Optional[str] = None,
         baseline_file: Optional[str] = None,
+        source_ip: Optional[str] = None,
+        jitter: float = 0.0,
+        score_passwords: bool = False,
+        diff_mode: bool = False,
     ):
         self.timeout = timeout
         self.verbose = verbose
@@ -261,6 +284,10 @@ class SSHAuditClient:
         self.detect_honeypot = detect_honeypot
         self.known_hosts_file = known_hosts_file
         self.baseline_file = baseline_file
+        self.source_ip = source_ip
+        self.jitter = jitter
+        self.score_passwords = score_passwords
+        self.diff_mode = diff_mode
         self.results: List[ScanResult] = []
         self.stats = ScanStatistics()
         self._setup_logging()
@@ -454,6 +481,178 @@ class SSHAuditClient:
         score = min(score, 1.0)
 
         return (score, reasons)
+
+    @staticmethod
+    def score_password_strength(password: str, username: str = "") -> Tuple[float, str]:
+        """
+        Score the strength of a password on a 0-100 scale.
+
+        Evaluates length, character diversity, common patterns,
+        and username similarity.
+
+        Args:
+            password: The password to score
+            username: Associated username for similarity check
+
+        Returns:
+            Tuple of (score 0-100, label string)
+        """
+        if not password:
+            return (0.0, "empty")
+
+        score = 0.0
+
+        # Length scoring (up to 30 points)
+        length = len(password)
+        if length >= 16:
+            score += 30
+        elif length >= 12:
+            score += 25
+        elif length >= 8:
+            score += 15
+        elif length >= 6:
+            score += 8
+        else:
+            score += 3
+
+        # Character class diversity (up to 25 points)
+        has_lower = bool(re.search(r'[a-z]', password))
+        has_upper = bool(re.search(r'[A-Z]', password))
+        has_digit = bool(re.search(r'[0-9]', password))
+        has_special = bool(re.search(r'[^a-zA-Z0-9]', password))
+
+        char_classes = sum([has_lower, has_upper, has_digit, has_special])
+        score += char_classes * 6.25  # 6.25 per class = 25 max
+
+        # Entropy estimation (up to 25 points)
+        charset_size = 0
+        if has_lower:
+            charset_size += 26
+        if has_upper:
+            charset_size += 26
+        if has_digit:
+            charset_size += 10
+        if has_special:
+            charset_size += 32
+
+        if charset_size > 0:
+            entropy = length * math.log2(charset_size)
+            # 128 bits = perfect, scale to 25 points
+            entropy_score = min(entropy / 128.0 * 25, 25)
+            score += entropy_score
+
+        # Penalties (up to -30 points)
+        penalties = 0
+
+        # Common password check
+        if password.lower() in COMMON_PASSWORDS:
+            penalties += 25
+
+        # Username similarity
+        if username and password.lower() == username.lower():
+            penalties += 20
+        elif username and username.lower() in password.lower():
+            penalties += 10
+
+        # Sequential characters (abc, 123, etc.)
+        sequential_count = 0
+        for i in range(len(password) - 2):
+            if (ord(password[i]) + 1 == ord(password[i+1]) ==
+                    ord(password[i+2]) - 1):
+                sequential_count += 1
+        if sequential_count > 0:
+            penalties += min(sequential_count * 5, 15)
+
+        # Repeated characters (aaa, 111)
+        repeat_count = 0
+        for i in range(len(password) - 2):
+            if password[i] == password[i+1] == password[i+2]:
+                repeat_count += 1
+        if repeat_count > 0:
+            penalties += min(repeat_count * 5, 10)
+
+        # All same character class
+        if length > 1 and char_classes == 1:
+            penalties += 5
+
+        # Common patterns
+        common_patterns = [
+            r'^[a-zA-Z]+\d+$',      # word + numbers (password123)
+            r'^\d+[a-zA-Z]+$',      # numbers + word (123abc)
+            r'^(.)\1+$',             # all same character (aaaa)
+            r'^(01|12|23|34|45|56|67|78|89|90)+', # sequential digits
+        ]
+        for pattern in common_patterns:
+            if re.match(pattern, password):
+                penalties += 5
+                break
+
+        score = max(0, score - penalties)
+        score = min(100, score)
+
+        # Label assignment
+        if score >= 80:
+            label = "very_strong"
+        elif score >= 60:
+            label = "strong"
+        elif score >= 40:
+            label = "moderate"
+        elif score >= 20:
+            label = "weak"
+        else:
+            label = "very_weak"
+
+        return (round(score, 1), label)
+
+    @staticmethod
+    def discover_ssh_ports(
+        host: str,
+        ports: Optional[List[int]] = None,
+        timeout: float = 2.0,
+        source_ip: Optional[str] = None,
+    ) -> List[Tuple[int, str]]:
+        """
+        Discover SSH services on a host by TCP connect scanning and
+        banner grabbing.
+
+        Args:
+            host: Target hostname or IP
+            ports: List of ports to check (defaults to COMMON_SSH_PORTS)
+            timeout: Connection timeout per port
+            source_ip: Source IP to bind to (optional)
+
+        Returns:
+            List of (port, banner) tuples for ports running SSH
+        """
+        if ports is None:
+            ports = list(COMMON_SSH_PORTS)
+
+        found: List[Tuple[int, str]] = []
+
+        for port in ports:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                if source_ip:
+                    sock.bind((source_ip, 0))
+                result = sock.connect_ex((host, port))
+                if result == 0:
+                    # Port is open, try to grab SSH banner
+                    try:
+                        banner = sock.recv(1024).decode('utf-8', errors='replace').strip()
+                        if banner.startswith('SSH-'):
+                            found.append((port, banner))
+                        else:
+                            # Port open but not SSH
+                            pass
+                    except (socket.timeout, Exception):
+                        # Port open but couldn't read banner - might still be SSH
+                        found.append((port, ""))
+                sock.close()
+            except Exception:
+                pass
+
+        return found
 
     @staticmethod
     def import_nmap_xml(filepath: str) -> List[str]:
@@ -766,6 +965,8 @@ class SSHAuditClient:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
+            if self.source_ip:
+                sock.bind((self.source_ip, 0))
             sock.connect((host, port))
             banner = sock.recv(1024).decode('utf-8', errors='replace').strip()
             sock.close()
@@ -994,8 +1195,8 @@ class SSHAuditClient:
             result.os_family = os_family
             result.ssh_version = ssh_version
 
-            # Attempt connection
-            client.connect(
+            # Attempt connection (with optional source IP binding)
+            connect_kwargs = dict(
                 hostname=host,
                 port=port,
                 username=username,
@@ -1003,8 +1204,16 @@ class SSHAuditClient:
                 timeout=self.timeout,
                 allow_agent=False,
                 look_for_keys=False,
-                banner_timeout=self.timeout
+                banner_timeout=self.timeout,
             )
+            if self.source_ip:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(self.timeout)
+                sock.bind((self.source_ip, 0))
+                sock.connect((host, port))
+                connect_kwargs['sock'] = sock
+
+            client.connect(**connect_kwargs)
 
             result.connection_time = time.time() - start_time
             result.success = True
@@ -1128,6 +1337,14 @@ class SSHAuditClient:
             result.honeypot_score = hp_score
             result.honeypot_reasons = hp_reasons
 
+        # Password strength scoring on successful logins
+        if self.score_passwords and result.success:
+            pw_score, pw_label = self.score_password_strength(
+                result.password, result.username
+            )
+            result.password_strength_score = pw_score
+            result.password_strength_label = pw_label
+
         return result
 
     def _should_skip(self, host: str, port: int, username: str) -> Optional[str]:
@@ -1206,6 +1423,21 @@ class SSHAuditClient:
                 print(f"    \033[93m⚠ Possible honeypot (score: {result.honeypot_score:.1f})\033[0m")
                 for hr in (result.honeypot_reasons or []):
                     print(f"      - {hr}")
+
+            if result.password_strength_label:
+                strength_colors = {
+                    "very_weak": "\033[91m",
+                    "weak": "\033[91m",
+                    "moderate": "\033[93m",
+                    "strong": "\033[92m",
+                    "very_strong": "\033[92m",
+                }
+                sc = strength_colors.get(result.password_strength_label, "")
+                print(
+                    f"    Password Strength: {sc}"
+                    f"{result.password_strength_label.upper()} "
+                    f"({result.password_strength_score:.0f}/100){color_end}"
+                )
 
         if self.verbose and result.error_message:
             print(f"    Error: {result.error_message}")
@@ -1401,6 +1633,14 @@ class SSHAuditClient:
                 print(f"Known hosts loaded: {len(self._known_host_keys)}")
             if self.baseline_file:
                 print(f"Baseline comparison: {self.baseline_file}")
+            if self.source_ip:
+                print(f"Source IP: {self.source_ip}")
+            if self.jitter > 0:
+                print(f"Jitter: 0-{self.jitter:.1f}s random delay")
+            if self.score_passwords:
+                print(f"Password scoring: enabled")
+            if self.diff_mode and self.baseline_file:
+                print(f"Delta/diff mode: enabled")
             print(f"{'='*60}\n")
 
         completed_items = list(completed_set)
@@ -1410,6 +1650,7 @@ class SSHAuditClient:
             # Multi-threaded execution
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
                 futures = {}
+                submit_count = 0
                 for h, p, u, pw in work_items:
                     if (h, p, u, pw) in completed_set:
                         continue
@@ -1421,8 +1662,13 @@ class SSHAuditClient:
                         elif skip_reason == "lockout_protection":
                             self.stats.skipped_lockout += 1
                         continue
+                    # Apply jitter delay between task submissions
+                    if self.jitter > 0 and submit_count > 0:
+                        jitter_delay = random.uniform(0, self.jitter)
+                        time.sleep(jitter_delay)
                     future = executor.submit(self._try_login, h, p, u, pw)
                     futures[future] = (h, p, u, pw)
+                    submit_count += 1
 
                 for future in as_completed(futures):
                     current += 1
@@ -1452,6 +1698,11 @@ class SSHAuditClient:
                     elif skip_reason == "lockout_protection":
                         self.stats.skipped_lockout += 1
                     continue
+
+                # Apply jitter delay between attempts
+                if self.jitter > 0 and current > len(completed_set):
+                    jitter_delay = random.uniform(0, self.jitter)
+                    time.sleep(jitter_delay)
 
                 current += 1
                 result = self._try_login(host, port, username, password)
@@ -1485,13 +1736,21 @@ class SSHAuditClient:
             try:
                 diff = self.compare_baseline(self.results, self.baseline_file)
                 self._print_baseline_diff(diff)
-                # Save diff alongside output
+                # Save diff output
                 if self.output_file:
-                    diff_path = str(Path(self.output_file).with_suffix('.diff.json'))
-                    with open(diff_path, 'w', encoding='utf-8') as f:
-                        json.dump(diff, f, indent=2)
-                    if not self.quiet:
-                        print(f"Baseline diff saved to: {diff_path}")
+                    if self.diff_mode:
+                        # In diff mode, the main output IS the diff
+                        diff_path = Path(self.output_file)
+                        self._save_diff_output(diff, diff_path)
+                        if not self.quiet:
+                            print(f"Differential output saved to: {self.output_file}")
+                    else:
+                        # Save diff alongside regular output
+                        diff_path = str(Path(self.output_file).with_suffix('.diff.json'))
+                        with open(diff_path, 'w', encoding='utf-8') as f:
+                            json.dump(diff, f, indent=2)
+                        if not self.quiet:
+                            print(f"Baseline diff saved to: {diff_path}")
             except (FileNotFoundError, ValueError) as e:
                 print(f"WARNING: Baseline comparison failed: {e}", file=sys.stderr)
 
@@ -1550,6 +1809,8 @@ class SSHAuditClient:
                     print(f"    \033[91m!!! HOST KEY CHANGED !!!\033[0m")
                 if r.honeypot_score >= 0.5:
                     print(f"    ⚠ Honeypot score: {r.honeypot_score:.1f}")
+                if r.password_strength_label:
+                    print(f"    Password Strength: {r.password_strength_label.upper()} ({r.password_strength_score:.0f}/100)")
             print()
 
     def _print_baseline_diff(self, diff: Dict[str, Any]):
@@ -1620,6 +1881,8 @@ class SSHAuditClient:
                 self._save_xml(path)
             elif self.output_format == "html":
                 self._save_html(path)
+            elif self.output_format == "pdf":
+                self._save_pdf(path)
             else:
                 self._save_text(path)
 
@@ -1941,6 +2204,296 @@ pre {{ background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto;
                 if r.error_message:
                     f.write(f"  Error: {r.error_message}\n")
 
+    def _save_pdf(self, path: Path):
+        """
+        Save results as a PDF report.
+
+        Uses a pure-Python PDF generation approach that does not
+        require external libraries like reportlab or fpdf.
+        Generates a minimal but complete PDF 1.4 file.
+        """
+        successful = [r for r in self.results if r.success]
+        severity_display = {
+            "critical": "CRITICAL",
+            "high": "HIGH",
+            "medium": "MEDIUM",
+            "low": "LOW",
+            "info": "INFO",
+        }
+
+        # Build PDF content lines
+        lines = []
+        lines.append(f"SSH Security Audit Report")
+        lines.append(f"Generated by {__program_name__} v{__version__}")
+        lines.append(f"Date: {self.stats.start_time.strftime('%Y-%m-%d %H:%M:%S') if self.stats.start_time else 'N/A'}")
+        lines.append("")
+        lines.append("=" * 60)
+        lines.append("SCAN STATISTICS")
+        lines.append("=" * 60)
+        lines.append(f"Total attempts:        {self.stats.total_attempts}")
+        lines.append(f"Successful logins:     {self.stats.successful_logins}")
+        lines.append(f"Failed logins:         {self.stats.failed_logins}")
+        lines.append(f"  - Auth failures:     {self.stats.authentication_errors}")
+        lines.append(f"  - Connection errors: {self.stats.connection_errors}")
+        lines.append(f"  - Timeouts:          {self.stats.timeout_errors}")
+        lines.append(f"Duration:              {self.stats.get_duration():.2f} seconds")
+        lines.append("")
+
+        if successful:
+            lines.append("=" * 60)
+            lines.append("SUCCESSFUL LOGINS")
+            lines.append("=" * 60)
+            lines.append("")
+            for r in successful:
+                sev_tag = severity_display.get(r.severity, r.severity.upper() if r.severity else "N/A")
+                lines.append(f"Host: {r.host}:{r.port}")
+                lines.append(f"Username: {r.username}")
+                lines.append(f"Password: {r.password}")
+                lines.append(f"Severity: {sev_tag}")
+                if r.banner:
+                    lines.append(f"Banner: {r.banner}")
+                if r.os_info:
+                    lines.append(f"OS: {r.os_info} ({r.os_family})")
+                if r.ssh_version:
+                    lines.append(f"SSH Version: {r.ssh_version}")
+                if r.host_key_type:
+                    lines.append(f"Host Key: {r.host_key_type} ({r.host_key_bits} bits)")
+                    lines.append(f"Fingerprint: {r.host_key_fingerprint}")
+                if r.password_strength_label:
+                    lines.append(f"Password Strength: {r.password_strength_label.upper()} ({r.password_strength_score:.0f}/100)")
+                if r.severity_reasons:
+                    lines.append("Findings:")
+                    for reason in r.severity_reasons:
+                        lines.append(f"  - {reason}")
+                if r.host_key_changed:
+                    lines.append("!!! HOST KEY CHANGED - possible MITM attack !!!")
+                if r.honeypot_score >= 0.5:
+                    lines.append(f"Honeypot score: {r.honeypot_score:.1f}")
+                if r.command_output:
+                    lines.append(f"Command Output: {r.command_output[:300]}")
+                elif r.initial_output:
+                    lines.append(f"Output: {r.initial_output[:300]}")
+                lines.append("-" * 40)
+                lines.append("")
+
+        lines.append("=" * 60)
+        lines.append("ALL RESULTS")
+        lines.append("=" * 60)
+        lines.append("")
+        for r in self.results:
+            status = "SUCCESS" if r.success else "FAILED"
+            sev = f" [{r.severity.upper()}]" if r.severity else ""
+            lines.append(f"[{status}]{sev} {r.host}:{r.port} {r.username}")
+            if r.error_message:
+                lines.append(f"  Error: {r.error_message[:100]}")
+
+        # Generate minimal PDF 1.4
+        self._write_pdf_file(path, lines)
+
+    def _write_pdf_file(self, path: Path, lines: List[str]):
+        """Write a minimal PDF 1.4 file with the given text lines."""
+        # PDF generation: build objects
+        objects = []
+        xref_offsets = []
+
+        # Escape special PDF characters in a text string
+        def pdf_escape(text: str) -> str:
+            return text.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+
+        # Build pages of content (approx 55 lines per page)
+        lines_per_page = 55
+        font_size = 10
+        leading = 12
+        margin_left = 50
+        margin_top = 750
+        page_width = 612  # US Letter
+        page_height = 792
+
+        pages_content = []
+        for i in range(0, len(lines), lines_per_page):
+            page_lines = lines[i:i + lines_per_page]
+            stream_parts = [f"BT /F1 {font_size} Tf"]
+            y = margin_top
+            for line in page_lines:
+                # Truncate very long lines for PDF
+                line = line[:100]
+                escaped = pdf_escape(line)
+                stream_parts.append(f"{margin_left} {y} Td ({escaped}) Tj")
+                y -= leading
+                stream_parts.append(f"0 0 Td")  # Reset position
+            # Use absolute positioning for each line
+            stream_lines = []
+            stream_lines.append(f"BT")
+            stream_lines.append(f"/F1 {font_size} Tf")
+            y = margin_top
+            for line in page_lines:
+                line = line[:100]
+                escaped = pdf_escape(line)
+                stream_lines.append(f"1 0 0 1 {margin_left} {y} Tm")
+                stream_lines.append(f"({escaped}) Tj")
+                y -= leading
+            stream_lines.append("ET")
+            pages_content.append("\n".join(stream_lines))
+
+        if not pages_content:
+            pages_content = ["BT /F1 10 Tf 50 750 Td (No results.) Tj ET"]
+
+        num_pages = len(pages_content)
+
+        # Object 1: Catalog
+        objects.append("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj")
+
+        # Object 2: Pages
+        page_obj_refs = " ".join(f"{i + 4} 0 R" for i in range(num_pages))
+        objects.append(
+            f"2 0 obj\n<< /Type /Pages /Kids [{page_obj_refs}] "
+            f"/Count {num_pages} >>\nendobj"
+        )
+
+        # Object 3: Font
+        objects.append(
+            "3 0 obj\n<< /Type /Font /Subtype /Type1 "
+            "/BaseFont /Courier >>\nendobj"
+        )
+
+        # Page objects and their stream objects
+        next_obj_id = 4
+        for idx, content in enumerate(pages_content):
+            page_obj_id = next_obj_id
+            stream_obj_id = next_obj_id + 1
+            next_obj_id += 2
+
+            # Page object
+            objects.append(
+                f"{page_obj_id} 0 obj\n"
+                f"<< /Type /Page /Parent 2 0 R "
+                f"/MediaBox [0 0 {page_width} {page_height}] "
+                f"/Contents {stream_obj_id} 0 R "
+                f"/Resources << /Font << /F1 3 0 R >> >> >>\n"
+                f"endobj"
+            )
+
+            # Stream object
+            stream_bytes = content.encode('latin-1', errors='replace')
+            stream_len = len(stream_bytes)
+            objects.append(
+                f"{stream_obj_id} 0 obj\n"
+                f"<< /Length {stream_len} >>\n"
+                f"stream\n{content}\nendstream\n"
+                f"endobj"
+            )
+
+        # Build PDF file
+        pdf_parts = []
+        pdf_parts.append(b"%PDF-1.4\n")
+
+        for obj_str in objects:
+            xref_offsets.append(len(b"".join(pdf_parts)))
+            pdf_parts.append(obj_str.encode('latin-1', errors='replace') + b"\n")
+
+        xref_start = len(b"".join(pdf_parts))
+        total_objs = len(objects) + 1  # +1 for free object entry
+
+        xref_lines = [f"xref\n0 {total_objs}\n"]
+        xref_lines.append("0000000000 65535 f \n")
+        for offset in xref_offsets:
+            xref_lines.append(f"{offset:010d} 00000 n \n")
+
+        pdf_parts.append("".join(xref_lines).encode('latin-1'))
+        pdf_parts.append(
+            f"trailer\n<< /Size {total_objs} /Root 1 0 R >>\n"
+            f"startxref\n{xref_start}\n%%EOF\n".encode('latin-1')
+        )
+
+        with open(path, 'wb') as f:
+            f.write(b"".join(pdf_parts))
+
+    def _save_diff_output(self, diff: Dict[str, Any], path: Path):
+        """
+        Save only the differential/delta changes to a file.
+
+        In diff mode, instead of the full report, outputs only changes
+        between current scan and the baseline.
+        """
+        output_data = {
+            "scan_info": {
+                "program": __program_name__,
+                "version": __version__,
+                "mode": "differential",
+                "start_time": self.stats.start_time.isoformat() if self.stats.start_time else None,
+                "end_time": self.stats.end_time.isoformat() if self.stats.end_time else None,
+            },
+            "changes": diff,
+        }
+
+        suffix = path.suffix.lower()
+        if suffix == '.json':
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+        elif suffix == '.csv':
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['change_type', 'host', 'port', 'username', 'password', 'detail'])
+                for h in diff.get('new_hosts', []):
+                    writer.writerow(['new_host', h['host'], h['port'], '', '', ''])
+                for h in diff.get('removed_hosts', []):
+                    writer.writerow(['removed_host', h['host'], h['port'], '', '', ''])
+                for c in diff.get('new_credentials', []):
+                    writer.writerow(['new_credential', c['host'], c['port'], c['username'], c['password'], ''])
+                for c in diff.get('lost_credentials', []):
+                    writer.writerow(['lost_credential', c['host'], c['port'], c['username'], c['password'], ''])
+                for hk in diff.get('host_key_changes', []):
+                    writer.writerow(['host_key_change', hk['host'], hk['port'], '', '',
+                                     f"{hk['previous_fingerprint']} -> {hk['current_fingerprint']}"])
+                for sv in diff.get('ssh_version_changes', []):
+                    writer.writerow(['ssh_version_change', sv['host'], sv['port'], '', '',
+                                     f"{sv['previous_version']} -> {sv['current_version']}"])
+        else:
+            # Default: text format
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(f"SSH Security Audit - Differential Report\n")
+                f.write(f"Generated by {__program_name__} v{__version__}\n")
+                f.write(f"{'='*60}\n\n")
+                summary = diff.get('summary', {})
+                total = sum(summary.values())
+                if total == 0:
+                    f.write("No changes detected.\n")
+                else:
+                    if diff.get('new_hosts'):
+                        f.write(f"NEW HOSTS ({len(diff['new_hosts'])}):\n")
+                        for h in diff['new_hosts']:
+                            f.write(f"  + {h['host']}:{h['port']}\n")
+                        f.write("\n")
+                    if diff.get('removed_hosts'):
+                        f.write(f"REMOVED HOSTS ({len(diff['removed_hosts'])}):\n")
+                        for h in diff['removed_hosts']:
+                            f.write(f"  - {h['host']}:{h['port']}\n")
+                        f.write("\n")
+                    if diff.get('new_credentials'):
+                        f.write(f"NEW CREDENTIALS ({len(diff['new_credentials'])}):\n")
+                        for c in diff['new_credentials']:
+                            f.write(f"  + {c['host']}:{c['port']} {c['username']}:{c['password']}\n")
+                        f.write("\n")
+                    if diff.get('lost_credentials'):
+                        f.write(f"LOST CREDENTIALS ({len(diff['lost_credentials'])}):\n")
+                        for c in diff['lost_credentials']:
+                            f.write(f"  - {c['host']}:{c['port']} {c['username']}:{c['password']}\n")
+                        f.write("\n")
+                    if diff.get('host_key_changes'):
+                        f.write(f"HOST KEY CHANGES ({len(diff['host_key_changes'])}):\n")
+                        for hk in diff['host_key_changes']:
+                            f.write(f"  ! {hk['host']}:{hk['port']}\n")
+                            f.write(f"    Previous: {hk['previous_type']} {hk['previous_fingerprint']}\n")
+                            f.write(f"    Current:  {hk['current_type']} {hk['current_fingerprint']}\n")
+                        f.write("\n")
+                    if diff.get('ssh_version_changes'):
+                        f.write(f"SSH VERSION CHANGES ({len(diff['ssh_version_changes'])}):\n")
+                        for sv in diff['ssh_version_changes']:
+                            f.write(f"  ~ {sv['host']}:{sv['port']}\n")
+                            f.write(f"    Previous: {sv['previous_version']}\n")
+                            f.write(f"    Current:  {sv['current_version']}\n")
+                        f.write("\n")
+
 
 def _severity_rank(sev: SeverityLevel) -> int:
     """Return numeric rank for severity comparison."""
@@ -2065,6 +2618,21 @@ Examples:
   %(prog)s -t 192.168.1.0/24 -u root -p pass --baseline previous_scan.json
       Compare results against a previous scan baseline
 
+  %(prog)s -t 192.168.1.1 -u root -p pass --source-ip 10.0.0.5
+      Scan using a specific source IP address
+
+  %(prog)s -t 192.168.1.0/24 -u root -p pass --jitter 2.0
+      Add 0-2 second random delay between attempts
+
+  %(prog)s -t 192.168.1.1 -u root -p pass --score-passwords -f pdf -o report.pdf
+      Score password strength and generate PDF report
+
+  %(prog)s -t 192.168.1.0/24 --scan-ports -u root -p pass
+      Discover SSH ports before scanning
+
+  %(prog)s -t 192.168.1.0/24 -u root -p pass --baseline prev.json --diff -o changes.json -f json
+      Output only the differences from baseline scan
+
 Report bugs to: https://github.com/rom/sshcheck/issues
         """
     )
@@ -2176,9 +2744,9 @@ Report bugs to: https://github.com/rom/sshcheck/issues
     )
     output_group.add_argument(
         '-f', '--format',
-        choices=['text', 'json', 'csv', 'xml', 'html'],
+        choices=['text', 'json', 'csv', 'xml', 'html', 'pdf'],
         default='text',
-        help='Output format: text, json, csv, xml, or html. Default: text'
+        help='Output format: text, json, csv, xml, html, or pdf. Default: text'
     )
     output_group.add_argument(
         '-v', '--verbose',
@@ -2297,6 +2865,62 @@ Report bugs to: https://github.com/rom/sshcheck/issues
         )
     )
 
+    # Source IP binding
+    network_group = parser.add_argument_group('Network Options')
+    network_group.add_argument(
+        '--source-ip',
+        metavar='IP',
+        help=(
+            'Bind to a specific source IP address for outgoing connections. '
+            'Useful for testing from different network interfaces or VLANs.'
+        )
+    )
+
+    # Service Discovery
+    discovery_group = parser.add_argument_group('Service Discovery')
+    discovery_group.add_argument(
+        '--scan-ports',
+        action='store_true',
+        help=(
+            'Discover SSH services before scanning. Performs a TCP connect '
+            'scan on common SSH ports (22, 2222, 2200, etc.) to find SSH '
+            'services. Discovered ports are added to the scan.'
+        )
+    )
+    discovery_group.add_argument(
+        '--discovery-ports',
+        metavar='PORTS',
+        help=(
+            'Comma-separated list of ports to check during service discovery. '
+            'Default: 22,2222,2200,22222,8022,830,222,2022,2220,10022'
+        )
+    )
+
+    # Differential output
+    diff_group = parser.add_argument_group('Differential Output')
+    diff_group.add_argument(
+        '--diff',
+        action='store_true',
+        dest='diff_mode',
+        help=(
+            'Enable differential/delta output mode. When used with --baseline, '
+            'the output file contains only changes between current and baseline '
+            'scans instead of the full report.'
+        )
+    )
+
+    # Password scoring
+    scoring_group = parser.add_argument_group('Password Analysis')
+    scoring_group.add_argument(
+        '--score-passwords',
+        action='store_true',
+        help=(
+            'Score password strength for successful logins. Evaluates length, '
+            'character diversity, common patterns, and entropy. Reports a '
+            '0-100 score with labels (very_weak, weak, moderate, strong, very_strong).'
+        )
+    )
+
     # Performance options
     perf_group = parser.add_argument_group('Performance Options')
     perf_group.add_argument(
@@ -2312,6 +2936,16 @@ Report bugs to: https://github.com/rom/sshcheck/issues
         default=10,
         metavar='SECONDS',
         help='Connection timeout in seconds. Default: 10'
+    )
+    perf_group.add_argument(
+        '--jitter',
+        type=float,
+        default=0.0,
+        metavar='SECONDS',
+        help=(
+            'Add random delay (0 to SECONDS) between connection attempts. '
+            'Helps avoid rate limiting and IDS detection. Default: 0 (no jitter).'
+        )
     )
 
     # Other options
@@ -2361,6 +2995,12 @@ def apply_config(args: argparse.Namespace, config: dict):
         'known_hosts': ('known_hosts', str, None),
         'baseline': ('baseline', str, None),
         'import_nmap': ('import_nmap', str, None),
+        'source_ip': ('source_ip', str, None),
+        'jitter': ('jitter', float, 0.0),
+        'score_passwords': ('score_passwords', bool, False),
+        'diff_mode': ('diff_mode', bool, False),
+        'scan_ports': ('scan_ports', bool, False),
+        'discovery_ports': ('discovery_ports', str, None),
     }
 
     for config_key, (attr_name, expected_type, default) in mapping.items():
@@ -2565,6 +3205,80 @@ def main():
         )
         sys.exit(1)
 
+    # Validate jitter
+    jitter_val = getattr(args, 'jitter', 0.0)
+    if jitter_val < 0:
+        print(
+            "ERROR: --jitter must be >= 0.\n"
+            f"Provided value: {jitter_val}",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    # Validate source IP
+    source_ip = getattr(args, 'source_ip', None)
+    if source_ip:
+        try:
+            ipaddress.ip_address(source_ip)
+        except ValueError:
+            print(
+                f"ERROR: Invalid source IP address: {source_ip}\n"
+                f"Please provide a valid IPv4 or IPv6 address.",
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+    # Validate diff mode requires baseline
+    diff_mode = getattr(args, 'diff_mode', False)
+    if diff_mode and not getattr(args, 'baseline', None):
+        print(
+            "ERROR: --diff requires --baseline to be specified.\n"
+            "The diff mode compares against a previous scan baseline.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    # Service discovery: scan for SSH ports before main scan
+    if getattr(args, 'scan_ports', False):
+        discovery_ports = None
+        if getattr(args, 'discovery_ports', None):
+            try:
+                discovery_ports = [
+                    int(p.strip()) for p in args.discovery_ports.split(',')
+                    if p.strip()
+                ]
+            except ValueError:
+                print(
+                    "ERROR: Invalid --discovery-ports format. Use comma-separated port numbers.",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+
+        if not args.quiet:
+            print(f"Discovering SSH services on {len(targets)} target(s)...")
+
+        discovered_ports = set(ports)
+        for target in targets:
+            # Expand targets for discovery
+            tmp_client = SSHAuditClient()
+            for host in tmp_client._parse_targets([target]):
+                found = SSHAuditClient.discover_ssh_ports(
+                    host,
+                    ports=discovery_ports,
+                    timeout=min(args.timeout, 3),
+                    source_ip=source_ip,
+                )
+                for port_num, banner in found:
+                    if port_num not in discovered_ports:
+                        discovered_ports.add(port_num)
+                        if not args.quiet:
+                            banner_info = f" ({banner})" if banner else ""
+                            print(f"  Discovered SSH on {host}:{port_num}{banner_info}")
+
+        ports = sorted(discovered_ports)
+        if not args.quiet:
+            print(f"Ports to scan: {ports}\n")
+
     # Create and run audit client
     client = SSHAuditClient(
         timeout=args.timeout,
@@ -2584,6 +3298,10 @@ def main():
         detect_honeypot=getattr(args, 'detect_honeypot', False),
         known_hosts_file=getattr(args, 'known_hosts', None),
         baseline_file=getattr(args, 'baseline', None),
+        source_ip=source_ip,
+        jitter=jitter_val,
+        score_passwords=getattr(args, 'score_passwords', False),
+        diff_mode=diff_mode,
     )
 
     try:

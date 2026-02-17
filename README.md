@@ -33,6 +33,13 @@ A Python-based SSH security audit tool for testing login capabilities across mul
 - **Account lockout protection**: Limit failed attempts per user to avoid lockouts
 - **Stop on first success**: Skip remaining credentials after finding valid login per host
 - **Concurrent scanning**: Multi-threaded execution for faster scans
+- **SSH key authentication**: Test with RSA, Ed25519, ECDSA, and DSA private keys
+- **Combo file support**: Load user:password pairs from combo files
+- **Proxy support**: Route connections through SOCKS4, SOCKS5, or HTTP proxies
+- **Color terminal output**: Colored progress, severity, and status indicators with `--no-color` option
+- **Progress bar with ETA**: Visual progress bar with elapsed time and estimated completion
+- **Enhanced CVE database**: Detailed per-CVE vulnerability checks (regreSSHion, Terrapin, etc.)
+- **Enhanced fingerprinting**: Regex-based SSH banner fingerprinting with software version extraction
 - **Comprehensive error handling**: Detailed error messages for troubleshooting
 
 ## Requirements
@@ -40,6 +47,7 @@ A Python-based SSH security audit tool for testing login capabilities across mul
 - Python 3.6 or later
 - paramiko library
 - pyyaml library (optional, for YAML config files)
+- pysocks library (optional, for SOCKS proxy support)
 
 ## Installation
 
@@ -62,6 +70,7 @@ chmod +x sshcheck.py
 ```bash
 pip install paramiko        # Required
 pip install pyyaml          # Optional: for YAML config files
+pip install pysocks         # Optional: for SOCKS proxy support
 ```
 
 ## Usage
@@ -97,6 +106,19 @@ pip install pyyaml          # Optional: for YAML config files
 | `--try-empty` | Also try empty/null password for each username |
 | `--user-as-pass` | Also try the username as the password for each user |
 
+#### Key Authentication
+
+| Option | Description |
+|--------|-------------|
+| `-k, --key FILE` | SSH private key file(s) for key-based authentication. Supports RSA, Ed25519, ECDSA, DSA. Can be specified multiple times. Use `-p` for key passphrase. |
+| `-K, --key-file FILE` | File containing paths to SSH private key files (one per line) |
+
+#### Combo File
+
+| Option | Description |
+|--------|-------------|
+| `-C, --combo-file FILE` | File containing username:password combinations (one per line). Format: `username:password`. Colons in passwords are supported. |
+
 #### Port Specification
 
 | Option | Description |
@@ -112,6 +134,70 @@ pip install pyyaml          # Optional: for YAML config files
 | `-f, --format FORMAT` | Output format: `text`, `json`, `csv`, `xml`, `html`, or `pdf`. Default: `text` |
 | `-v, --verbose` | Enable verbose output with detailed error messages |
 | `-q, --quiet` | Suppress progress output, only show summary |
+| `--no-color` | Disable colored output. Useful for piping output to files or non-terminal use. |
+
+#### Scan Control
+
+| Option | Description |
+|--------|-------------|
+| `--stop-on-success` | Stop testing a host:port after the first successful login |
+| `--max-attempts-per-user NUM` | Max failed attempts per username per host before skipping (lockout protection). 0 = unlimited (default) |
+| `-c, --command CMD` | Execute command on successful login and capture output |
+| `--checkpoint FILE` | Save scan progress to checkpoint file |
+| `--resume FILE` | Resume scan from a checkpoint file |
+| `--spray` | Credential spray mode: try one password across all users/hosts before the next |
+
+#### Target Exclusion
+
+| Option | Description |
+|--------|-------------|
+| `--exclude HOST` | Host(s) to exclude from scanning. Accepts same formats as `-t`. Can be specified multiple times. |
+| `--exclude-file FILE` | File containing hosts to exclude (one per line) |
+
+#### Security Features
+
+| Option | Description |
+|--------|-------------|
+| `--detect-honeypot` | Enable honeypot detection (analyzes banners, response patterns for Cowrie, Kippo, etc.) |
+| `--known-hosts FILE` | Check host keys against known hosts file for MITM detection. Supports OpenSSH and JSON formats. Discovered keys are saved back after scanning. |
+| `--baseline FILE` | Compare results against a previous scan baseline (JSON). Reports new/removed hosts, changed credentials, host key changes, SSH version changes. |
+
+#### Nmap Integration
+
+| Option | Description |
+|--------|-------------|
+| `--import-nmap FILE` | Import targets from Nmap XML output. Extracts hosts with open SSH ports. Can be combined with `-t`. |
+
+#### Configuration
+
+| Option | Description |
+|--------|-------------|
+| `--config FILE` | Load configuration from YAML or JSON file. CLI arguments override config file values. |
+
+#### Network Options
+
+| Option | Description |
+|--------|-------------|
+| `--source-ip IP` | Bind to a specific source IP address for outgoing connections. Useful for testing from different network interfaces or VLANs. |
+
+#### Service Discovery
+
+| Option | Description |
+|--------|-------------|
+| `--scan-ports` | Discover SSH services before scanning. Performs TCP connect scan on common SSH ports to find SSH services. |
+| `--discovery-ports PORTS` | Comma-separated list of ports to check during discovery. Default: 22,2222,2200,22222,8022,830,222,2022,2220,10022 |
+
+#### Differential Output
+
+| Option | Description |
+|--------|-------------|
+| `--diff` | Enable differential/delta output mode. When used with `--baseline`, the output file contains only changes between scans instead of the full report. |
+
+#### Password Analysis
+
+| Option | Description |
+|--------|-------------|
+| `--score-passwords` | Score password strength for successful logins. Reports a 0-100 score with labels (very_weak, weak, moderate, strong, very_strong). |
 
 #### Scan Control
 
@@ -183,6 +269,12 @@ pip install pyyaml          # Optional: for YAML config files
 | `-n, --threads NUM` | Number of concurrent threads. Default: 1 |
 | `--timeout SECONDS` | Connection timeout in seconds. Default: 10 |
 | `--jitter SECONDS` | Add random delay (0 to SECONDS) between connection attempts. Helps avoid rate limiting and IDS detection. Default: 0 |
+
+#### Proxy Options
+
+| Option | Description |
+|--------|-------------|
+| `--proxy URL` | Route connections through a proxy. Supported formats: `socks5://host:port`, `socks4://host:port`, `http://host:port`. SOCKS proxy requires PySocks (`pip install pysocks`). |
 
 #### Other Options
 
@@ -346,6 +438,52 @@ nmap -p 22,2222 -sV -oX scan.xml 192.168.1.0/24
 ./sshcheck.py -t 192.168.1.0/24 -U users.txt -P passwords.txt --baseline baseline.json --diff -o changes.json -f json
 ```
 
+### SSH key authentication
+
+```bash
+# Scan with a single key
+./sshcheck.py -t 192.168.1.1 -u admin -k ~/.ssh/id_rsa
+
+# Scan with multiple keys
+./sshcheck.py -t 192.168.1.1 -u admin -k ~/.ssh/id_rsa -k ~/.ssh/id_ed25519
+
+# Key with passphrase
+./sshcheck.py -t 192.168.1.1 -u admin -k ~/.ssh/id_rsa -p mypassphrase
+
+# Keys from file
+./sshcheck.py -t 192.168.1.0/24 -u root -K key_list.txt
+```
+
+### Combo file (user:password pairs)
+
+```bash
+# Scan using a combo file
+./sshcheck.py -t 192.168.1.0/24 -C combos.txt
+
+# Combo file with additional targets and output
+./sshcheck.py -T targets.txt -C combos.txt -o results.json -f json
+```
+
+### Proxy support
+
+```bash
+# Through SOCKS5 proxy (e.g., Tor)
+./sshcheck.py -t 192.168.1.1 -u root -p pass --proxy socks5://127.0.0.1:9050
+
+# Through HTTP proxy
+./sshcheck.py -t 192.168.1.1 -u root -p pass --proxy http://proxy.example.com:8080
+
+# Through SOCKS4 proxy
+./sshcheck.py -t 192.168.1.1 -u root -p pass --proxy socks4://127.0.0.1:1080
+```
+
+### Disable color output
+
+```bash
+# Disable color (useful for piping to files)
+./sshcheck.py -t 192.168.1.0/24 -u root -p pass --no-color > results.txt
+```
+
 ## Configuration File
 
 sshcheck supports JSON and YAML configuration files. CLI arguments override config file values.
@@ -466,6 +604,27 @@ toor
 2222
 22222
 8022
+```
+
+### Combo File (combos.txt)
+
+```text
+# username:password pairs
+root:password
+admin:admin123
+user:changeme
+test:test
+# Colons in passwords are supported
+deploy:p@ss:w0rd
+```
+
+### Key File List (keys.txt)
+
+```text
+# SSH private key files
+/home/user/.ssh/id_rsa
+/home/user/.ssh/id_ed25519
+/opt/keys/deploy_key
 ```
 
 ## Output Formats
@@ -610,6 +769,57 @@ The `--format pdf` option generates a PDF security audit report with no external
 - Honeypot and MITM detection results
 - All scan results listing
 
+## SSH Key Authentication
+
+sshcheck supports key-based authentication using `-k` or `-K` options. Supported key types:
+
+- **RSA** keys
+- **Ed25519** keys
+- **ECDSA** keys
+- **DSA** keys (legacy)
+
+Key files are auto-detected for type. If a key is encrypted, use `-p` to provide the passphrase. Keys can be combined with password-based testing in the same scan.
+
+## Combo File Support
+
+The `-C` option loads credential pairs from a combo file in `username:password` format. This is useful when you have pre-matched credential pairs (e.g., from database dumps). Colons in passwords are handled correctly (split on first colon only).
+
+## Proxy Support
+
+The `--proxy` option routes all SSH connections through a proxy server:
+
+- **SOCKS5**: `--proxy socks5://host:port` (requires PySocks library)
+- **SOCKS4**: `--proxy socks4://host:port` (requires PySocks library)
+- **HTTP CONNECT**: `--proxy http://host:port`
+
+This is useful for:
+- Scanning through Tor for anonymity
+- Testing from behind corporate proxies
+- Routing through jump boxes or bastion hosts
+
+## Color Output
+
+Terminal output uses colored text for improved readability:
+- **Green**: Successful logins and positive indicators
+- **Red**: Failed attempts, critical/high severity, host key changes
+- **Yellow**: Medium severity, warnings, honeypot indicators
+- **Cyan**: Progress bar and informational headers
+
+Disable with `--no-color` for piping output to files or when using a terminal without color support.
+
+## CVE Vulnerability Database
+
+sshcheck includes a built-in database of known SSH vulnerabilities checked against server banners:
+
+- **CVE-2024-6387** (regreSSHion): Remote code execution in OpenSSH 8.5p1-9.7p1
+- **CVE-2023-48795** (Terrapin Attack): Prefix truncation on OpenSSH, Dropbear, libssh
+- **CVE-2023-38408**: Remote code execution via ssh-agent forwarding
+- **CVE-2021-41617**: Privilege escalation in OpenSSH 6.2-8.7
+- **CVE-2018-15473**: Username enumeration in OpenSSH < 7.8
+- And more for OpenSSH, Dropbear, and libssh
+
+Vulnerabilities are automatically checked and reported with severity levels.
+
 ## Nmap XML Import
 
 Import targets from Nmap XML output (`-oX`) to scan only hosts with SSH ports open:
@@ -702,6 +912,13 @@ pip install paramiko
 Install the optional YAML support:
 ```bash
 pip install pyyaml
+```
+
+### "PySocks is required for SOCKS proxy support"
+
+Install the optional SOCKS proxy library:
+```bash
+pip install pysocks
 ```
 
 ### Connection timeouts

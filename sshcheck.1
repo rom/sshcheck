@@ -1,6 +1,6 @@
 .\" Man page for sshcheck
 .\" Contact: rom@romab.com
-.TH SSHCHECK 1 "February 2026" "sshcheck 4.0.0" "Security Audit Tools"
+.TH SSHCHECK 1 "February 2026" "sshcheck 5.0.0" "Security Audit Tools"
 .SH NAME
 sshcheck \- SSH Security Audit Client for testing login capabilities
 .SH SYNOPSIS
@@ -8,9 +8,13 @@ sshcheck \- SSH Security Audit Client for testing login capabilities
 [\fB\-t\fR \fIHOST\fR | \fB\-T\fR \fIFILE\fR]
 [\fB\-u\fR \fIUSER\fR | \fB\-U\fR \fIFILE\fR]
 [\fB\-p\fR \fIPASS\fR | \fB\-P\fR \fIFILE\fR]
+[\fB\-k\fR \fIFILE\fR | \fB\-K\fR \fIFILE\fR]
+[\fB\-C\fR \fIFILE\fR]
 [\fB\-\-try\-empty\fR]
 [\fB\-\-user\-as\-pass\fR]
 [\fB\-\-port\fR \fIPORT\fR | \fB\-\-port-file\fR \fIFILE\fR]
+[\fB\-\-proxy\fR \fIURL\fR]
+[\fB\-\-no\-color\fR]
 [\fB\-c\fR \fICMD\fR]
 [\fB\-\-config\fR \fIFILE\fR]
 [\fB\-\-spray\fR]
@@ -84,6 +88,22 @@ that allow passwordless login.
 .BR \-\-user\-as\-pass
 Also try the username as the password for each user. Tests for the common
 misconfiguration where the password equals the username.
+.SS "Key Authentication"
+.TP
+.BR \-k ", " \-\-key " " \fIFILE\fR
+SSH private key file(s) for key-based authentication. Supports RSA, Ed25519,
+ECDSA, and DSA keys. Can be specified multiple times. Use \fB-p\fR to provide
+a passphrase for encrypted keys.
+.TP
+.BR \-K ", " \-\-key-file " " \fIFILE\fR
+File containing paths to SSH private key files, one per line. Lines starting
+with # are treated as comments.
+.SS "Combo File"
+.TP
+.BR \-C ", " \-\-combo-file " " \fIFILE\fR
+File containing username:password combinations, one per line. Format:
+username:password. Colons in passwords are supported (splits on first colon).
+Lines starting with # are treated as comments.
 .SS "Port Specification"
 .TP
 .BR \-\-port " " \fIPORT\fR
@@ -118,6 +138,10 @@ Enable verbose output with detailed error messages and debug information.
 .TP
 .BR \-q ", " \-\-quiet
 Suppress progress output, only show final summary.
+.TP
+.BR \-\-no\-color
+Disable colored terminal output. Useful for piping output to files or
+when using terminals without color support.
 .SS "Scan Control"
 .TP
 .BR \-\-stop\-on\-success
@@ -219,6 +243,18 @@ Increase for slow networks or decrease for faster scanning.
 .BR \-\-jitter " " \fISECONDS\fR
 Add random delay (0 to SECONDS) between connection attempts.
 Helps avoid rate limiting and IDS detection. Default: 0 (no jitter).
+.SS "Proxy Options"
+.TP
+.BR \-\-proxy " " \fIURL\fR
+Route all connections through a proxy. Supported formats:
+.RS
+.IP \fBsocks5://host:port\fR
+SOCKS5 proxy (requires PySocks library)
+.IP \fBsocks4://host:port\fR
+SOCKS4 proxy (requires PySocks library)
+.IP \fBhttp://host:port\fR
+HTTP CONNECT proxy
+.RE
 .SS "Other Options"
 .TP
 .BR \-V ", " \-\-version
@@ -278,6 +314,28 @@ services to the target list.
 .SS "Differential Output"
 The \fB\-\-diff\fR option (used with \fB\-\-baseline\fR) outputs only changes
 between scans instead of full reports, ideal for monitoring pipelines.
+.SS "SSH Key Authentication"
+The \fB\-k\fR option supports testing with SSH private keys. Key types are
+auto-detected (RSA, Ed25519, ECDSA, DSA). Encrypted keys require a
+passphrase via \fB\-p\fR. Multiple keys can be tested per host.
+.SS "Combo File Support"
+The \fB\-C\fR option loads pre-matched username:password pairs from a file,
+useful for testing leaked credentials or database dumps.
+.SS "Proxy Support"
+The \fB\-\-proxy\fR option tunnels all SSH connections through SOCKS4,
+SOCKS5, or HTTP CONNECT proxies. Useful for scanning through Tor,
+corporate proxies, or bastion hosts.
+.SS "CVE Vulnerability Database"
+A built-in database checks SSH server versions against known CVEs including
+CVE-2024-6387 (regreSSHion), CVE-2023-48795 (Terrapin Attack),
+CVE-2023-38408 (ssh-agent RCE), and others for OpenSSH, Dropbear, and libssh.
+.SS "Color Output"
+Terminal output uses colored text for readability. Green for success, red for
+failures and critical severity, yellow for warnings, cyan for progress.
+Disable with \fB\-\-no\-color\fR for piped output.
+.SS "Progress Bar"
+A visual progress bar with ETA is displayed during scanning, showing
+completion percentage, elapsed time, and estimated remaining time.
 .SS "PDF Reports"
 The \fB\-f pdf\fR option generates self-contained PDF security audit reports
 with no external Python dependencies.
@@ -389,6 +447,24 @@ SSH port discovery before scanning:
 .TP
 Differential output (changes only):
 .B sshcheck -t 192.168.1.0/24 -u root -p pass --baseline prev.json --diff -o changes.json -f json
+.TP
+SSH key authentication:
+.B sshcheck -t 192.168.1.1 -u admin -k ~/.ssh/id_rsa
+.TP
+Multiple key files:
+.B sshcheck -t 192.168.1.1 -u admin -k ~/.ssh/id_rsa -k ~/.ssh/id_ed25519
+.TP
+Combo file scanning:
+.B sshcheck -t 192.168.1.0/24 -C combos.txt -o results.json -f json
+.TP
+Scan through SOCKS5 proxy (Tor):
+.B sshcheck -t 192.168.1.1 -u root -p pass --proxy socks5://127.0.0.1:9050
+.TP
+Scan through HTTP proxy:
+.B sshcheck -t 192.168.1.1 -u root -p pass --proxy http://proxy.example.com:8080
+.TP
+Disable color output:
+.B sshcheck -t 192.168.1.0/24 -u root -p pass --no-color
 .SH ERROR MESSAGES
 .TP
 .B "Authentication failed"
@@ -418,6 +494,9 @@ Example passwords file
 .TP
 .I examples/scan_profile.json
 Example JSON configuration file
+.TP
+.I examples/combos.txt
+Example combo file (username:password pairs)
 .SH SECURITY CONSIDERATIONS
 .PP
 This tool is designed for authorized security testing only.
@@ -436,6 +515,8 @@ Python 3.6 or later
 paramiko >= 2.7.0 (pip install paramiko)
 .IP \(bu 2
 pyyaml >= 5.0.0 (optional, for YAML config files)
+.IP \(bu 2
+pysocks >= 1.7.0 (optional, for SOCKS proxy support)
 .SH BUGS
 Report bugs at: https://github.com/rom/sshcheck/issues
 .SH AUTHOR

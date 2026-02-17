@@ -47,9 +47,16 @@ try:
 except ImportError:
     HAS_YAML = False
 
+# Optional dependency: PySocks for SOCKS proxy support
+try:
+    import socks as pysocks
+    HAS_PYSOCKS = True
+except ImportError:
+    HAS_PYSOCKS = False
+
 
 # Version information
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 __program_name__ = "sshcheck"
 
 
@@ -62,7 +69,7 @@ class SeverityLevel(Enum):
     INFO = "info"
 
 
-# Known vulnerable OpenSSH versions (CVE-based)
+# Known vulnerable OpenSSH versions (CVE-based, legacy prefix matching)
 VULNERABLE_VERSIONS = {
     # version_prefix: (severity, description)
     "OpenSSH_3.": (SeverityLevel.CRITICAL, "Ancient OpenSSH, multiple critical CVEs"),
@@ -77,37 +84,188 @@ VULNERABLE_VERSIONS = {
     "OpenSSH_8.": (SeverityLevel.INFO, "Generally secure, check specific patch level"),
 }
 
-# Weak SSH algorithms
+
+# ============================================================================
+# Version Comparison Helpers (for CVE database)
+# ============================================================================
+
+def _parse_version(version_str: str) -> tuple:
+    """Parse a version string into a tuple of integers."""
+    match = re.match(r'(\d+(?:\.\d+)*(?:p\d+)?)', version_str)
+    if not match:
+        return (0,)
+    ver = match.group(1)
+    parts = re.split(r'[.p]', ver)
+    return tuple(int(x) for x in parts if x.isdigit())
+
+
+def _version_lt(version: str, target: tuple) -> bool:
+    """Check if version is less than target."""
+    return _parse_version(version) < target
+
+
+def _version_gte(version: str, target: tuple) -> bool:
+    """Check if version is greater than or equal to target."""
+    return _parse_version(version) >= target
+
+
+def _version_in_range(version: str, low: tuple, high: tuple) -> bool:
+    """Check if version is in range [low, high] inclusive."""
+    v = _parse_version(version)
+    return low <= v <= high
+
+
+# Detailed CVE vulnerability database with version-specific checks
+SSH_VULNERABILITIES = {
+    "OpenSSH": [
+        {
+            "cve": "CVE-2024-6387",
+            "name": "regreSSHion",
+            "severity": "HIGH",
+            "affected": "OpenSSH 8.5p1 - 9.7p1 (except 9.6p2+)",
+            "description": "Race condition in signal handler allows unauthenticated remote code execution",
+            "check": lambda v: _version_in_range(v, (8, 5), (9, 7)) and not _version_gte(v, (9, 6, 2))
+        },
+        {
+            "cve": "CVE-2023-51385",
+            "name": "OS command injection via ssh and ssh-keygen",
+            "severity": "MEDIUM",
+            "affected": "OpenSSH < 9.6",
+            "description": "OS command injection via expansion tokens in certain conditions",
+            "check": lambda v: _version_lt(v, (9, 6))
+        },
+        {
+            "cve": "CVE-2023-48795",
+            "name": "Terrapin Attack",
+            "severity": "MEDIUM",
+            "affected": "OpenSSH < 9.6",
+            "description": "Prefix truncation attack on Binary Packet Protocol (BPP) with ChaCha20-Poly1305 or CBC with Encrypt-then-MAC",
+            "check": lambda v: _version_lt(v, (9, 6))
+        },
+        {
+            "cve": "CVE-2023-38408",
+            "name": "Remote code execution via ssh-agent forwarding",
+            "severity": "HIGH",
+            "affected": "OpenSSH < 9.3p2",
+            "description": "Remote code execution via PKCS#11 providers in forwarded ssh-agent",
+            "check": lambda v: _version_lt(v, (9, 3, 2))
+        },
+        {
+            "cve": "CVE-2021-41617",
+            "name": "Privilege escalation via AuthorizedKeysCommand/AuthorizedPrincipalsCommand",
+            "severity": "HIGH",
+            "affected": "OpenSSH 6.2 - 8.7",
+            "description": "sshd allows privilege escalation because supplemental groups are not initialized as expected",
+            "check": lambda v: _version_in_range(v, (6, 2), (8, 7))
+        },
+        {
+            "cve": "CVE-2020-15778",
+            "name": "Command injection via scp",
+            "severity": "HIGH",
+            "affected": "OpenSSH < 9.0",
+            "description": "Command injection via backtick characters in scp target filenames",
+            "check": lambda v: _version_lt(v, (9, 0))
+        },
+        {
+            "cve": "CVE-2019-6111",
+            "name": "SCP client spoofing via object name",
+            "severity": "MEDIUM",
+            "affected": "OpenSSH < 8.0",
+            "description": "SCP client allows server to write arbitrary files via modified object names",
+            "check": lambda v: _version_lt(v, (8, 0))
+        },
+        {
+            "cve": "CVE-2018-15473",
+            "name": "Username enumeration",
+            "severity": "MEDIUM",
+            "affected": "OpenSSH < 7.8",
+            "description": "User enumeration via malformed authentication requests",
+            "check": lambda v: _version_lt(v, (7, 8))
+        },
+        {
+            "cve": "CVE-2016-20012",
+            "name": "Username enumeration via auth timing",
+            "severity": "LOW",
+            "affected": "OpenSSH < 8.8",
+            "description": "Allows remote attackers to enumerate valid usernames via timing differences",
+            "check": lambda v: _version_lt(v, (8, 8))
+        },
+    ],
+    "Dropbear": [
+        {
+            "cve": "CVE-2023-48795",
+            "name": "Terrapin Attack",
+            "severity": "MEDIUM",
+            "affected": "Dropbear < 2022.83+",
+            "description": "Prefix truncation attack on Binary Packet Protocol",
+            "check": lambda v: _version_lt(v, (2022, 83))
+        },
+        {
+            "cve": "CVE-2021-36369",
+            "name": "Trivial authentication bypass",
+            "severity": "HIGH",
+            "affected": "Dropbear < 2022.82",
+            "description": "Allows trivial authentication when no login credentials are configured",
+            "check": lambda v: _version_lt(v, (2022, 82))
+        },
+    ],
+    "libssh": [
+        {
+            "cve": "CVE-2023-48795",
+            "name": "Terrapin Attack",
+            "severity": "MEDIUM",
+            "affected": "libssh < 0.10.6 / 0.9.8",
+            "description": "Prefix truncation attack on Binary Packet Protocol",
+            "check": lambda v: _version_lt(v, (0, 10, 6))
+        },
+        {
+            "cve": "CVE-2023-6004",
+            "name": "ProxyCommand/ProxyJump command injection",
+            "severity": "LOW",
+            "affected": "libssh < 0.10.6 / 0.9.8",
+            "description": "Command injection via hostname with ProxyCommand/ProxyJump",
+            "check": lambda v: _version_lt(v, (0, 10, 6))
+        },
+    ],
+}
+
 WEAK_ALGORITHMS = {
     "kex": {
         "diffie-hellman-group1-sha1": "Weak 1024-bit DH group",
         "diffie-hellman-group-exchange-sha1": "SHA-1 based key exchange",
+        "diffie-hellman-group14-sha1": "Uses SHA-1 which is deprecated",
         "ecdh-sha2-nistp256": "NIST curve, potential backdoor concerns",
+        "kexguess2@matt.ucc.asn.au": "Non-standard, potentially insecure KEX guess extension",
     },
     "cipher": {
         "arcfour": "RC4 stream cipher, broken",
         "arcfour128": "RC4 stream cipher, broken",
         "arcfour256": "RC4 stream cipher, broken",
-        "aes128-cbc": "CBC mode vulnerable to BEAST-like attacks",
-        "aes192-cbc": "CBC mode vulnerable to BEAST-like attacks",
-        "aes256-cbc": "CBC mode vulnerable to BEAST-like attacks",
-        "3des-cbc": "Triple DES, slow and weak",
-        "blowfish-cbc": "Blowfish CBC, deprecated",
-        "cast128-cbc": "CAST128 CBC, deprecated",
+        "aes128-cbc": "CBC mode vulnerable to padding oracle attacks (CVE-2008-5161)",
+        "aes192-cbc": "CBC mode vulnerable to padding oracle attacks (CVE-2008-5161)",
+        "aes256-cbc": "CBC mode vulnerable to padding oracle attacks (CVE-2008-5161)",
+        "3des-cbc": "Triple DES, 64-bit block size, vulnerable to Sweet32",
+        "blowfish-cbc": "Legacy cipher, 64-bit block size, vulnerable to Sweet32",
+        "cast128-cbc": "Legacy cipher, 64-bit block size",
+        "rijndael-cbc@lysator.liu.se": "CBC mode, renamed AES-256-CBC",
     },
     "mac": {
-        "hmac-md5": "MD5 based MAC, weak",
-        "hmac-md5-96": "MD5 based MAC, weak",
-        "hmac-sha1": "SHA-1 based MAC, deprecated",
-        "hmac-sha1-96": "SHA-1 based MAC, deprecated",
+        "hmac-md5": "MD5 is cryptographically broken",
+        "hmac-md5-96": "MD5 is cryptographically broken, truncated to 96 bits",
+        "hmac-sha1": "SHA-1 is deprecated",
+        "hmac-sha1-96": "SHA-1 is deprecated, truncated to 96 bits",
+        "umac-64@openssh.com": "64-bit UMAC, short tag length",
+        "hmac-ripemd160": "RIPEMD-160 no longer considered secure",
+        "hmac-ripemd160@openssh.com": "RIPEMD-160 no longer considered secure",
     },
     "host_key": {
-        "ssh-dss": "DSA 1024-bit key, considered weak",
-        "ssh-rsa": "RSA with SHA-1, deprecated in OpenSSH 8.8+",
+        "ssh-dss": "DSA keys limited to 1024 bits, insufficient security",
+        "ssh-rsa": "RSA with SHA-1 signatures, deprecated in OpenSSH 8.8+",
+        "ecdsa-sha2-nistp256": "NIST curve with potential backdoor concerns",
     },
 }
 
-# OS fingerprinting patterns from SSH banners
+# OS fingerprinting patterns from SSH banners (simple substring matching)
 OS_FINGERPRINTS = [
     # (pattern, os_name, os_family)
     ("Ubuntu", "Ubuntu Linux", "Linux"),
@@ -129,6 +287,32 @@ OS_FINGERPRINTS = [
     ("libssh", "libssh-based server", "Unknown"),
     ("Bitvise", "Bitvise SSH Server (Windows)", "Windows"),
     ("OpenSSH", "OpenSSH (generic)", "Unix"),
+]
+
+# Enhanced regex-based fingerprinting database (for detailed analysis)
+SSH_FINGERPRINTS = [
+    # (regex_pattern, software, os_guess)
+    (r"SSH-2\.0-OpenSSH_(\S+)\s+Ubuntu", "OpenSSH", "Ubuntu Linux"),
+    (r"SSH-2\.0-OpenSSH_(\S+)\s+Debian", "OpenSSH", "Debian Linux"),
+    (r"SSH-2\.0-OpenSSH_(\S+)\s+FreeBSD", "OpenSSH", "FreeBSD"),
+    (r"SSH-2\.0-OpenSSH.*fc\d+", "OpenSSH", "Fedora Linux"),
+    (r"SSH-2\.0-OpenSSH.*el\d+", "OpenSSH", "RHEL/CentOS Linux"),
+    (r"SSH-2\.0-OpenSSH_for_Windows", "OpenSSH", "Windows"),
+    (r"SSH-2\.0-OpenSSH_(\S+)", "OpenSSH", "Unknown (likely Linux/Unix)"),
+    (r"SSH-2\.0-dropbear_(\S+)", "Dropbear", "Embedded/Linux"),
+    (r"SSH-2\.0-dropbear", "Dropbear", "Embedded/Linux"),
+    (r"SSH-2\.0-libssh[_-](\S+)", "libssh", "Unknown"),
+    (r"SSH-2\.0-libssh", "libssh", "Unknown"),
+    (r"SSH-2\.0-ROSSSH", "RouterOS SSH", "MikroTik RouterOS"),
+    (r"SSH-2\.0-Cisco", "Cisco SSH", "Cisco IOS/IOS-XE"),
+    (r"SSH-1\.99-Cisco", "Cisco SSH", "Cisco IOS (legacy)"),
+    (r"SSH-2\.0-Serv-U", "Serv-U", "Windows (Serv-U FTP)"),
+    (r"SSH-2\.0-HUAWEI", "Huawei SSH", "Huawei VRP"),
+    (r"SSH-2\.0-xxxxxxx", "Unknown (obfuscated)", "Unknown (banner obfuscated)"),
+    (r"SSH-2\.0-paramiko_(\S+)", "Paramiko", "Python application"),
+    (r"SSH-2\.0-Go", "Go SSH", "Go application"),
+    (r"SSH-2\.0-AsyncSSH_(\S+)", "AsyncSSH", "Python application"),
+    (r"SSH-1\.", "SSHv1", "Legacy (SSHv1 - INSECURE)"),
 ]
 
 # Known honeypot signatures
@@ -165,6 +349,32 @@ COMMON_SSH_PORTS = [22, 2222, 2200, 22222, 8022, 830, 222, 2022, 2220, 10022]
 
 
 @dataclass
+class FingerprintInfo:
+    """OS/software fingerprint information from SSH banner."""
+    software: str = ""
+    software_version: str = ""
+    os_guess: str = ""
+    raw_banner: str = ""
+    protocol_version: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class VulnerabilityInfo:
+    """Known vulnerability information."""
+    cve: str = ""
+    name: str = ""
+    severity: str = ""
+    affected: str = ""
+    description: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class ScanResult:
     """Data class to store scan results for a single attempt."""
     host: str
@@ -177,6 +387,8 @@ class ScanResult:
     error_message: str = ""
     banner: str = ""
     connection_time: float = 0.0
+    auth_method: str = "password"
+    key_file: str = ""
     host_key_type: str = ""
     host_key_fingerprint: str = ""
     host_key_bits: int = 0
@@ -194,6 +406,8 @@ class ScanResult:
     host_key_previous: str = ""
     password_strength_score: float = 0.0
     password_strength_label: str = ""
+    fingerprint_info: Optional[FingerprintInfo] = None
+    vulnerabilities: Optional[List[VulnerabilityInfo]] = None
 
     def to_dict(self) -> dict:
         """Convert result to dictionary."""
@@ -207,6 +421,10 @@ class ScanResult:
             d['severity_reasons'] = []
         if d['honeypot_reasons'] is None:
             d['honeypot_reasons'] = []
+        if d['fingerprint_info'] is None:
+            d['fingerprint_info'] = {}
+        if d['vulnerabilities'] is None:
+            d['vulnerabilities'] = []
         return d
 
 
@@ -240,6 +458,113 @@ class CheckpointData:
     timestamp: str
 
 
+# ============================================================================
+# Color Support
+# ============================================================================
+
+class ColorOutput:
+    """Manages colored terminal output with toggle support."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled and sys.stdout.isatty()
+
+    def green(self, text: str) -> str:
+        return f"\033[92m{text}\033[0m" if self.enabled else text
+
+    def red(self, text: str) -> str:
+        return f"\033[91m{text}\033[0m" if self.enabled else text
+
+    def yellow(self, text: str) -> str:
+        return f"\033[93m{text}\033[0m" if self.enabled else text
+
+    def cyan(self, text: str) -> str:
+        return f"\033[96m{text}\033[0m" if self.enabled else text
+
+    def bold(self, text: str) -> str:
+        return f"\033[1m{text}\033[0m" if self.enabled else text
+
+    def dim(self, text: str) -> str:
+        return f"\033[2m{text}\033[0m" if self.enabled else text
+
+
+# ============================================================================
+# Progress Bar
+# ============================================================================
+
+class ProgressBar:
+    """Terminal progress bar with ETA calculation."""
+
+    def __init__(self, total: int, color: ColorOutput, width: int = 30):
+        self.total = total
+        self.color = color
+        self.width = width
+        self.start_time = time.time()
+        self._last_line_length = 0
+
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds into human-readable time."""
+        if seconds < 0 or seconds > 86400 * 7:
+            return "--:--"
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+
+    def update(self, current: int, status_text: str = ""):
+        """Update progress bar display."""
+        if self.total <= 0:
+            return
+
+        percentage = (current / self.total) * 100
+        filled = int(self.width * current / self.total)
+        bar = "█" * filled + "░" * (self.width - filled)
+
+        elapsed = time.time() - self.start_time
+        if current > 0:
+            rate = elapsed / current
+            remaining = rate * (self.total - current)
+            eta_str = self._format_time(remaining)
+        else:
+            eta_str = "--:--"
+
+        elapsed_str = self._format_time(elapsed)
+
+        line = (
+            f"\r{self.color.cyan('Progress')} |{bar}| "
+            f"{percentage:5.1f}% "
+            f"[{current}/{self.total}] "
+            f"Elapsed: {elapsed_str} ETA: {eta_str}"
+        )
+        if status_text:
+            line += f"  {status_text}"
+
+        padding = max(0, self._last_line_length - len(line))
+        sys.stdout.write(line + " " * padding)
+        sys.stdout.flush()
+        self._last_line_length = len(line)
+
+    def finish(self):
+        """Complete the progress bar."""
+        elapsed = time.time() - self.start_time
+        elapsed_str = self._format_time(elapsed)
+        bar = "█" * self.width
+        line = (
+            f"\r{self.color.cyan('Progress')} |{bar}| "
+            f"100.0% "
+            f"[{self.total}/{self.total}] "
+            f"Elapsed: {elapsed_str} Done!"
+        )
+        padding = max(0, self._last_line_length - len(line))
+        sys.stdout.write(line + " " * padding + "\n")
+        sys.stdout.flush()
+
+
+# ============================================================================
+# Main SSH Audit Client
+# ============================================================================
+
 class SSHAuditClient:
     """SSH Security Audit Client for testing login capabilities."""
 
@@ -266,6 +591,8 @@ class SSHAuditClient:
         jitter: float = 0.0,
         score_passwords: bool = False,
         diff_mode: bool = False,
+        color: bool = True,
+        proxy: Optional[str] = None,
     ):
         self.timeout = timeout
         self.verbose = verbose
@@ -290,7 +617,27 @@ class SSHAuditClient:
         self.diff_mode = diff_mode
         self.results: List[ScanResult] = []
         self.stats = ScanStatistics()
+        self.color = ColorOutput(enabled=color)
+        self.proxy = proxy
+        self._proxy_type = None
+        self._proxy_host = None
+        self._proxy_port = None
         self._setup_logging()
+        self._parse_proxy()
+
+        # Track per-host/user failure counts for lockout protection
+        self._failure_counts: Dict[str, int] = {}
+        # Track hosts with successful logins for stop-on-success
+        self._successful_hosts: Set[str] = set()
+        # Known host keys for MITM detection
+        self._known_host_keys: Dict[str, Tuple[str, str]] = {}  # host:port -> (type, fingerprint)
+        # Load known hosts if provided
+        if self.known_hosts_file:
+            self._load_known_hosts()
+        # Excluded host set (expanded from CIDRs, ranges, etc.)
+        self._excluded_set: Set[str] = set()
+        if self.exclude_hosts:
+            self._build_exclusion_set()
 
         # Track per-host/user failure counts for lockout protection
         self._failure_counts: Dict[str, int] = {}
@@ -319,6 +666,196 @@ class SSHAuditClient:
             datefmt="%Y-%m-%d %H:%M:%S"
         )
         self.logger = logging.getLogger(__name__)
+
+    def _parse_proxy(self):
+        """Parse proxy URL into components."""
+        if not self.proxy:
+            return
+
+        proxy = self.proxy.strip()
+
+        if proxy.startswith("socks5://") or proxy.startswith("socks5h://"):
+            self._proxy_type = "socks5"
+            proxy = proxy.split("://", 1)[1]
+        elif proxy.startswith("socks4://"):
+            self._proxy_type = "socks4"
+            proxy = proxy.split("://", 1)[1]
+        elif proxy.startswith("http://"):
+            self._proxy_type = "http"
+            proxy = proxy.split("://", 1)[1]
+        elif proxy.startswith("https://"):
+            self._proxy_type = "http"
+            proxy = proxy.split("://", 1)[1]
+        else:
+            self._proxy_type = "socks5"
+
+        if ":" in proxy:
+            host, port_str = proxy.rsplit(":", 1)
+            try:
+                self._proxy_port = int(port_str)
+            except ValueError:
+                raise ValueError(f"Invalid proxy port: {port_str}")
+            self._proxy_host = host
+        else:
+            self._proxy_host = proxy
+            self._proxy_port = 1080 if self._proxy_type in ("socks4", "socks5") else 8080
+
+    def _create_proxy_socket(self, dest_host: str, dest_port: int) -> socket.socket:
+        """Create a socket connection through the configured proxy."""
+        if self._proxy_type in ("socks4", "socks5"):
+            if not HAS_PYSOCKS:
+                raise ImportError(
+                    "PySocks is required for SOCKS proxy support.\n"
+                    "Install with: pip install pysocks"
+                )
+            proxy_type_map = {
+                "socks4": pysocks.SOCKS4,
+                "socks5": pysocks.SOCKS5,
+            }
+            sock = pysocks.socksocket()
+            sock.set_proxy(
+                proxy_type_map[self._proxy_type],
+                self._proxy_host,
+                self._proxy_port
+            )
+            sock.settimeout(self.timeout)
+            sock.connect((dest_host, dest_port))
+            return sock
+
+        elif self._proxy_type == "http":
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            sock.connect((self._proxy_host, self._proxy_port))
+
+            connect_req = (
+                f"CONNECT {dest_host}:{dest_port} HTTP/1.1\r\n"
+                f"Host: {dest_host}:{dest_port}\r\n"
+                f"\r\n"
+            )
+            sock.sendall(connect_req.encode())
+
+            response = b""
+            while b"\r\n\r\n" not in response:
+                data = sock.recv(4096)
+                if not data:
+                    raise ConnectionError("HTTP proxy closed connection during CONNECT")
+                response += data
+
+            status_line = response.split(b"\r\n")[0].decode("utf-8", errors="replace")
+            if "200" not in status_line:
+                raise ConnectionError(f"HTTP proxy CONNECT failed: {status_line}")
+
+            return sock
+
+        raise ValueError(f"Unsupported proxy type: {self._proxy_type}")
+
+    def _parse_combo_file(self, filepath: str) -> List[Tuple[str, str]]:
+        """Parse a credential combo file with user:password format."""
+        lines = self._read_file_lines(filepath, "combo")
+        combos = []
+        for line in lines:
+            if ':' in line:
+                username, password = line.split(':', 1)
+                username = username.strip()
+                password = password.strip()
+                if username:
+                    combos.append((username, password))
+            else:
+                self.logger.warning(f"Skipping invalid combo line (no colon separator): {line}")
+        return combos
+
+    def _load_private_key(
+        self,
+        key_file: str,
+        passphrase: Optional[str] = None
+    ) -> paramiko.PKey:
+        """
+        Load an SSH private key file, auto-detecting the key type.
+        Supports RSA, Ed25519, ECDSA, and DSA keys.
+        """
+        key_path = Path(key_file)
+        if not key_path.exists():
+            raise FileNotFoundError(f"Key file not found: {key_file}")
+        if not key_path.is_file():
+            raise ValueError(f"Key path is not a file: {key_file}")
+
+        key_classes = [
+            (paramiko.RSAKey, "RSA"),
+            (paramiko.Ed25519Key, "Ed25519"),
+            (paramiko.ECDSAKey, "ECDSA"),
+        ]
+        if hasattr(paramiko, 'DSSKey'):
+            key_classes.append((paramiko.DSSKey, "DSA"))
+
+        last_error = None
+        for key_class, key_name in key_classes:
+            try:
+                return key_class.from_private_key_file(key_file, password=passphrase)
+            except paramiko.PasswordRequiredException:
+                raise paramiko.SSHException(
+                    f"Key file {key_file} is encrypted but no passphrase provided. "
+                    f"Use -p to specify the passphrase."
+                )
+            except (paramiko.SSHException, ValueError) as e:
+                last_error = e
+                continue
+
+        raise paramiko.SSHException(
+            f"Unable to load key file {key_file}: Unsupported key type or invalid format. "
+            f"Last error: {last_error}"
+        )
+
+    def _fingerprint_banner(self, banner: str) -> FingerprintInfo:
+        """Analyze SSH banner to identify software and OS using regex patterns."""
+        info = FingerprintInfo(raw_banner=banner)
+
+        if not banner:
+            return info
+
+        if banner.startswith("SSH-"):
+            parts = banner.split("-", 2)
+            if len(parts) >= 2:
+                info.protocol_version = parts[1]
+
+        for pattern, software, os_guess in SSH_FINGERPRINTS:
+            match = re.match(pattern, banner, re.IGNORECASE)
+            if match:
+                info.software = software
+                info.os_guess = os_guess
+                if match.groups():
+                    info.software_version = match.group(1)
+                break
+
+        if not info.software and banner.startswith("SSH-"):
+            parts = banner.split("-", 2)
+            if len(parts) >= 3:
+                info.software = parts[2].split("_")[0] if "_" in parts[2] else parts[2].split()[0]
+
+        return info
+
+    def _check_vulnerabilities(self, fingerprint: FingerprintInfo) -> List[VulnerabilityInfo]:
+        """Check for known vulnerabilities based on software fingerprint."""
+        vulns = []
+
+        if not fingerprint.software or not fingerprint.software_version:
+            return vulns
+
+        software_vulns = SSH_VULNERABILITIES.get(fingerprint.software, [])
+
+        for vuln in software_vulns:
+            try:
+                if vuln["check"](fingerprint.software_version):
+                    vulns.append(VulnerabilityInfo(
+                        cve=vuln["cve"],
+                        name=vuln["name"],
+                        severity=vuln["severity"],
+                        affected=vuln["affected"],
+                        description=vuln["description"]
+                    ))
+            except Exception:
+                pass
+
+        return vulns
 
     def _build_exclusion_set(self):
         """Build the set of excluded hosts from exclusion list."""
@@ -963,11 +1500,14 @@ class SSHAuditClient:
             SSH banner string or empty string on failure
         """
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout)
-            if self.source_ip:
-                sock.bind((self.source_ip, 0))
-            sock.connect((host, port))
+            if self._proxy_type:
+                sock = self._create_proxy_socket(host, port)
+            else:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(self.timeout)
+                if self.source_ip:
+                    sock.bind((self.source_ip, 0))
+                sock.connect((host, port))
             banner = sock.recv(1024).decode('utf-8', errors='replace').strip()
             sock.close()
             return banner
@@ -1157,7 +1697,8 @@ class SSHAuditClient:
         host: str,
         port: int,
         username: str,
-        password: str
+        password: str,
+        key_file: Optional[str] = None
     ) -> ScanResult:
         """
         Attempt SSH login to a target host.
@@ -1166,20 +1707,24 @@ class SSHAuditClient:
             host: Target hostname or IP
             port: Target port
             username: SSH username
-            password: SSH password
+            password: SSH password (or key passphrase if key_file specified)
+            key_file: Optional path to SSH private key file
 
         Returns:
             ScanResult object with attempt details
         """
         timestamp = datetime.now().isoformat()
         start_time = time.time()
+        auth_method = "key" if key_file else "password"
         result = ScanResult(
             host=host,
             port=port,
             username=username,
-            password=password,
+            password=password if not key_file else "",
             success=False,
-            timestamp=timestamp
+            timestamp=timestamp,
+            auth_method=auth_method,
+            key_file=key_file or ""
         )
 
         client = paramiko.SSHClient()
@@ -1189,18 +1734,25 @@ class SSHAuditClient:
             # Get banner before full connection
             result.banner = self._get_ssh_banner(host, port)
 
-            # Fingerprint OS from banner
+            # Fingerprint OS from banner (simple method)
             os_info, os_family, ssh_version = self._fingerprint_os(result.banner)
             result.os_info = os_info
             result.os_family = os_family
             result.ssh_version = ssh_version
 
-            # Attempt connection (with optional source IP binding)
+            # Enhanced banner fingerprinting
+            result.fingerprint_info = self._fingerprint_banner(result.banner)
+
+            # CVE vulnerability checking
+            if result.fingerprint_info:
+                result.vulnerabilities = self._check_vulnerabilities(result.fingerprint_info)
+
+            # Build connection kwargs
+
             connect_kwargs = dict(
                 hostname=host,
                 port=port,
                 username=username,
-                password=password,
                 timeout=self.timeout,
                 allow_agent=False,
                 look_for_keys=False,
@@ -1212,6 +1764,26 @@ class SSHAuditClient:
                 sock.bind((self.source_ip, 0))
                 sock.connect((host, port))
                 connect_kwargs['sock'] = sock
+
+            client.connect(**connect_kwargs)
+
+            # Create proxy socket if needed
+            if self._proxy_type:
+                sock = self._create_proxy_socket(host, port)
+                connect_kwargs['sock'] = sock
+            elif self.source_ip:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(self.timeout)
+                sock.bind((self.source_ip, 0))
+                sock.connect((host, port))
+                connect_kwargs['sock'] = sock
+
+            # Key-based or password authentication
+            if key_file:
+                pkey = self._load_private_key(key_file, password if password else None)
+                connect_kwargs['pkey'] = pkey
+            else:
+                connect_kwargs['password'] = password
 
             client.connect(**connect_kwargs)
 
@@ -1379,28 +1951,33 @@ class SSHAuditClient:
             return
 
         percentage = (current / total) * 100 if total > 0 else 0
-        status = "[SUCCESS]" if result.success else "[FAILED]"
-        color_start = "\033[92m" if result.success else "\033[91m"
-        color_end = "\033[0m"
+        if result.success:
+            status = self.color.green("[SUCCESS]")
+        else:
+            status = self.color.red("[FAILED]")
+
+        auth_info = f"user={result.username}"
+        if result.key_file:
+            auth_info += f" key={result.key_file}"
 
         print(
-            f"[{current}/{total}] ({percentage:5.1f}%) "
-            f"{color_start}{status}{color_end} "
+            f"\n[{current}/{total}] ({percentage:5.1f}%) "
+            f"{status} "
             f"{result.host}:{result.port} "
-            f"user={result.username}"
+            f"{auth_info}"
         )
 
         if result.success:
             if result.severity:
-                sev_colors = {
-                    "critical": "\033[91m",
-                    "high": "\033[91m",
-                    "medium": "\033[93m",
-                    "low": "\033[94m",
-                    "info": "\033[90m",
+                sev_map = {
+                    "critical": self.color.red,
+                    "high": self.color.red,
+                    "medium": self.color.yellow,
+                    "low": self.color.cyan,
+                    "info": self.color.dim,
                 }
-                sc = sev_colors.get(result.severity, "")
-                print(f"    Severity: {sc}{result.severity.upper()}{color_end}")
+                sev_fn = sev_map.get(result.severity, self.color.dim)
+                print(f"    Severity: {sev_fn(result.severity.upper())}")
 
             if result.initial_output:
                 first_line = result.initial_output.split('\n')[0][:60]
@@ -1416,27 +1993,26 @@ class SSHAuditClient:
                 print(f"    Host Key: {result.host_key_type} ({result.host_key_fingerprint})")
 
             if result.host_key_changed:
-                print(f"    \033[91m!!! HOST KEY CHANGED - possible MITM !!!\033[0m")
+                print(f"    {self.color.red('!!! HOST KEY CHANGED - possible MITM !!!')}")
                 print(f"    Previous: {result.host_key_previous}")
 
             if result.honeypot_score >= 0.5:
-                print(f"    \033[93m⚠ Possible honeypot (score: {result.honeypot_score:.1f})\033[0m")
+                print(f"    {self.color.yellow(f'Possible honeypot (score: {result.honeypot_score:.1f})')}")
                 for hr in (result.honeypot_reasons or []):
                     print(f"      - {hr}")
 
             if result.password_strength_label:
-                strength_colors = {
-                    "very_weak": "\033[91m",
-                    "weak": "\033[91m",
-                    "moderate": "\033[93m",
-                    "strong": "\033[92m",
-                    "very_strong": "\033[92m",
+                strength_map = {
+                    "very_weak": self.color.red,
+                    "weak": self.color.red,
+                    "moderate": self.color.yellow,
+                    "strong": self.color.green,
+                    "very_strong": self.color.green,
                 }
-                sc = strength_colors.get(result.password_strength_label, "")
+                strength_fn = strength_map.get(result.password_strength_label, self.color.dim)
                 print(
-                    f"    Password Strength: {sc}"
-                    f"{result.password_strength_label.upper()} "
-                    f"({result.password_strength_score:.0f}/100){color_end}"
+                    f"    Password Strength: "
+                    f"{strength_fn(f'{result.password_strength_label.upper()} ({result.password_strength_score:.0f}/100)')}"
                 )
 
         if self.verbose and result.error_message:
@@ -1498,7 +2074,9 @@ class SSHAuditClient:
         targets: List[str],
         usernames: List[str],
         passwords: List[str],
-        ports: List[int]
+        ports: List[int],
+        key_files: Optional[List[str]] = None,
+        combo_list: Optional[List[Tuple[str, str]]] = None
     ) -> List[ScanResult]:
         """
         Perform SSH audit scan on specified targets.
@@ -1508,6 +2086,8 @@ class SSHAuditClient:
             usernames: List of usernames to try
             passwords: List of passwords to try
             ports: List of ports to try
+            key_files: Optional list of SSH private key files
+            combo_list: Optional list of (username, password) tuples from combo files
 
         Returns:
             List of ScanResult objects
@@ -1532,29 +2112,27 @@ class SSHAuditClient:
             print("Please provide valid IP addresses, hostnames, or CIDR ranges.", file=sys.stderr)
             return []
 
-        if not usernames:
-            print("ERROR: No usernames specified.", file=sys.stderr)
-            print("Please provide at least one username using -u or -U options.", file=sys.stderr)
-            return []
+        has_password_creds = usernames and (passwords or self.try_empty or self.user_as_pass)
+        has_key_creds = key_files and usernames
+        has_combo_creds = combo_list
 
-        if not passwords and not self.try_empty and not self.user_as_pass:
-            print("ERROR: No passwords specified.", file=sys.stderr)
-            print("Please provide at least one password using -p or -P options.", file=sys.stderr)
+        if not has_password_creds and not has_key_creds and not has_combo_creds:
+            print("ERROR: No credentials specified.", file=sys.stderr)
+            print("Please provide username/password, key files, or combo file.", file=sys.stderr)
             return []
 
         if not ports:
             ports = [22]
 
-        # Build work items - order depends on spray mode
+        # Build work items: (host, port, username, password, key_file)
         work_items = []
-        if self.spray_mode:
-            # Spray mode: try one password across all users/hosts before next password
-            # Build the unique password set across all users
+
+        # Password-based work items (spray or normal mode)
+        if self.spray_mode and has_password_creds:
             all_pw_sets = {}
             for username in usernames:
                 all_pw_sets[username] = self._build_password_list(passwords, username)
 
-            # Find the maximum password list length
             max_pw_len = max(len(v) for v in all_pw_sets.values()) if all_pw_sets else 0
 
             for pw_idx in range(max_pw_len):
@@ -1563,15 +2141,29 @@ class SSHAuditClient:
                         for username in usernames:
                             pw_list = all_pw_sets[username]
                             if pw_idx < len(pw_list):
-                                work_items.append((host, port, username, pw_list[pw_idx]))
-        else:
-            # Normal mode: try all passwords per user per host
+                                work_items.append((host, port, username, pw_list[pw_idx], None))
+        elif has_password_creds:
             for host in hosts:
                 for port in ports:
                     for username in usernames:
                         pw_list = self._build_password_list(passwords, username)
                         for password in pw_list:
-                            work_items.append((host, port, username, password))
+                            work_items.append((host, port, username, password, None))
+
+        # Key-based work items
+        if has_key_creds:
+            for host in hosts:
+                for port in ports:
+                    for username in usernames:
+                        for kf in key_files:
+                            work_items.append((host, port, username, "", kf))
+
+        # Combo file work items
+        if has_combo_creds:
+            for host in hosts:
+                for port in ports:
+                    for username, password in combo_list:
+                        work_items.append((host, port, username, password, None))
 
         total = len(work_items)
 
@@ -1581,13 +2173,11 @@ class SSHAuditClient:
         if checkpoint:
             for item in checkpoint.get("completed", []):
                 completed_set.add((str(item[0]), int(item[1]), str(item[2]), str(item[3])))
-            # Restore previous results
             for r_dict in checkpoint.get("results", []):
                 self.results.append(ScanResult(**{
                     k: v for k, v in r_dict.items()
                     if k in ScanResult.__dataclass_fields__
                 }))
-            # Restore stats
             prev_stats = checkpoint.get("stats", {})
             self.stats.total_attempts = prev_stats.get("total_attempts", 0)
             self.stats.successful_logins = prev_stats.get("successful_logins", 0)
@@ -1597,7 +2187,6 @@ class SSHAuditClient:
             self.stats.authentication_errors = prev_stats.get("authentication_errors", 0)
             self.stats.skipped_lockout = prev_stats.get("skipped_lockout", 0)
             self.stats.skipped_stop_on_success = prev_stats.get("skipped_stop_on_success", 0)
-            # Rebuild successful hosts set from previous results
             for r in self.results:
                 if r.success:
                     self._successful_hosts.add(f"{r.host}:{r.port}")
@@ -1606,13 +2195,18 @@ class SSHAuditClient:
 
         if not self.quiet:
             print(f"\n{'='*60}")
-            print(f"SSH Security Audit - {__program_name__} v{__version__}")
+            print(f"SSH Security Audit - {self.color.bold(f'{__program_name__} v{__version__}')}")
             print(f"{'='*60}")
             print(f"Targets: {len(hosts)} host(s)")
-            print(f"Usernames: {len(usernames)}")
-            print(f"Passwords: {len(passwords)}"
-                  f"{' (+empty)' if self.try_empty else ''}"
-                  f"{' (+user-as-pass)' if self.user_as_pass else ''}")
+            if has_password_creds:
+                print(f"Usernames: {len(usernames)}")
+                print(f"Passwords: {len(passwords)}"
+                      f"{' (+empty)' if self.try_empty else ''}"
+                      f"{' (+user-as-pass)' if self.user_as_pass else ''}")
+            if has_key_creds:
+                print(f"Key files: {len(key_files)}")
+            if has_combo_creds:
+                print(f"Combo entries: {len(combo_list)}")
             print(f"Ports: {ports}")
             print(f"Total combinations: {total}")
             print(f"Threads: {self.threads}")
@@ -1641,17 +2235,23 @@ class SSHAuditClient:
                 print(f"Password scoring: enabled")
             if self.diff_mode and self.baseline_file:
                 print(f"Delta/diff mode: enabled")
+            if self.proxy:
+                print(f"Proxy: {self.proxy}")
             print(f"{'='*60}\n")
 
         completed_items = list(completed_set)
         current = len(completed_set)
+        # Create progress bar for non-quiet mode
+        progress_bar = None
+        if not self.quiet and total > 0:
+            progress_bar = ProgressBar(total, self.color)
 
         if self.threads > 1:
             # Multi-threaded execution
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
                 futures = {}
                 submit_count = 0
-                for h, p, u, pw in work_items:
+                for h, p, u, pw, kf in work_items:
                     if (h, p, u, pw) in completed_set:
                         continue
                     skip_reason = self._should_skip(h, p, u)
@@ -1662,12 +2262,11 @@ class SSHAuditClient:
                         elif skip_reason == "lockout_protection":
                             self.stats.skipped_lockout += 1
                         continue
-                    # Apply jitter delay between task submissions
                     if self.jitter > 0 and submit_count > 0:
                         jitter_delay = random.uniform(0, self.jitter)
                         time.sleep(jitter_delay)
-                    future = executor.submit(self._try_login, h, p, u, pw)
-                    futures[future] = (h, p, u, pw)
+                    future = executor.submit(self._try_login, h, p, u, pw, kf)
+                    futures[future] = (h, p, u, pw, kf)
                     submit_count += 1
 
                 for future in as_completed(futures):
@@ -1676,17 +2275,19 @@ class SSHAuditClient:
                         result = future.result()
                         self.results.append(result)
                         item = futures[future]
-                        completed_items.append(item)
+                        completed_items.append(item[:4])
+                        status = self.color.green("OK") if result.success else self.color.red("FAIL")
+                        if progress_bar:
+                            progress_bar.update(current, f"{status} {result.host}:{result.port}")
                         self._print_progress(result, current, total)
-                        # Save checkpoint periodically
                         if self.checkpoint_file and current % 50 == 0:
                             self._save_checkpoint(completed_items)
                     except Exception as e:
-                        h, p, u, pw = futures[future]
+                        h, p, u, pw, kf = futures[future]
                         print(f"ERROR: Unexpected exception for {h}:{p}: {e}", file=sys.stderr)
         else:
             # Single-threaded execution
-            for host, port, username, password in work_items:
+            for host, port, username, password, kf in work_items:
                 if (host, port, username, password) in completed_set:
                     continue
 
@@ -1699,20 +2300,24 @@ class SSHAuditClient:
                         self.stats.skipped_lockout += 1
                     continue
 
-                # Apply jitter delay between attempts
                 if self.jitter > 0 and current > len(completed_set):
                     jitter_delay = random.uniform(0, self.jitter)
                     time.sleep(jitter_delay)
 
                 current += 1
-                result = self._try_login(host, port, username, password)
+                result = self._try_login(host, port, username, password, kf)
                 self.results.append(result)
                 completed_items.append((host, port, username, password))
+                status = self.color.green("OK") if result.success else self.color.red("FAIL")
+                if progress_bar:
+                    progress_bar.update(current, f"{status} {result.host}:{result.port}")
                 self._print_progress(result, current, total)
 
-                # Save checkpoint periodically
                 if self.checkpoint_file and current % 50 == 0:
                     self._save_checkpoint(completed_items)
+
+        if progress_bar:
+            progress_bar.finish()
 
         self.stats.end_time = datetime.now()
 
@@ -1759,19 +2364,19 @@ class SSHAuditClient:
     def _print_summary(self):
         """Print scan summary statistics."""
         if self.quiet:
-            # In quiet mode, only show successful logins
             successful = [r for r in self.results if r.success]
             if successful:
                 for r in successful:
-                    print(f"{r.host}:{r.port} {r.username}:{r.password}")
+                    cred = f"{r.username}:{r.password}" if r.auth_method == "password" else f"{r.username} (key:{r.key_file})"
+                    print(f"{r.host}:{r.port} {cred}")
             return
 
         print(f"\n{'='*60}")
-        print("SCAN SUMMARY")
+        print(self.color.bold("SCAN SUMMARY"))
         print(f"{'='*60}")
         print(f"Total attempts:        {self.stats.total_attempts}")
-        print(f"Successful logins:     {self.stats.successful_logins}")
-        print(f"Failed logins:         {self.stats.failed_logins}")
+        print(f"Successful logins:     {self.color.green(str(self.stats.successful_logins))}")
+        print(f"Failed logins:         {self.color.red(str(self.stats.failed_logins))}")
         print(f"  - Auth failures:     {self.stats.authentication_errors}")
         print(f"  - Connection errors: {self.stats.connection_errors}")
         print(f"  - Timeouts:          {self.stats.timeout_errors}")
@@ -1782,35 +2387,60 @@ class SSHAuditClient:
         print(f"Duration:              {self.stats.get_duration():.2f} seconds")
         print(f"{'='*60}")
 
-        # List successful logins
+        # Successful logins
         successful = [r for r in self.results if r.success]
         if successful:
-            print("\nSUCCESSFUL LOGINS:")
+            print(f"\n{self.color.bold('SUCCESSFUL LOGINS:')}")
             print("-" * 40)
             for r in successful:
                 sev_tag = f" [{r.severity.upper()}]" if r.severity else ""
-                print(f"  {r.host}:{r.port} - {r.username}:{r.password}{sev_tag}")
+                if r.auth_method == "key":
+                    cred = f"{r.username} (key: {r.key_file})"
+                else:
+                    cred = f"{r.username}:{r.password}"
+                print(f"  {self.color.green(f'{r.host}:{r.port}')} - {cred}{sev_tag}")
                 if r.banner:
-                    print(f"    Banner: {r.banner}")
+                    print(f"    {self.color.dim('Banner:')} {r.banner}")
                 if r.os_info:
-                    print(f"    OS: {r.os_info}")
+                    print(f"    {self.color.dim('OS:')} {r.os_info}")
                 if r.host_key_type:
-                    print(f"    Host Key: {r.host_key_type} {r.host_key_fingerprint}")
+                    print(f"    {self.color.dim('Host Key:')} {r.host_key_type} {r.host_key_fingerprint}")
                 if r.command_output:
                     output_preview = r.command_output[:200].replace('\n', ' ')
-                    print(f"    Command Output: {output_preview}")
+                    print(f"    {self.color.dim('Command Output:')} {output_preview}")
                 elif r.initial_output:
                     output_preview = r.initial_output[:200].replace('\n', ' ')
-                    print(f"    Output: {output_preview}...")
+                    print(f"    {self.color.dim('Output:')} {output_preview}...")
                 if r.severity_reasons:
                     for reason in r.severity_reasons:
-                        print(f"    ! {reason}")
+                        print(f"    {self.color.yellow('!')} {reason}")
                 if r.host_key_changed:
-                    print(f"    \033[91m!!! HOST KEY CHANGED !!!\033[0m")
+                    print(f"    {self.color.red('!!! HOST KEY CHANGED !!!')}")
                 if r.honeypot_score >= 0.5:
-                    print(f"    ⚠ Honeypot score: {r.honeypot_score:.1f}")
+                    print(f"    {self.color.yellow(f'Possible honeypot (score: {r.honeypot_score:.1f})')}")
                 if r.password_strength_label:
                     print(f"    Password Strength: {r.password_strength_label.upper()} ({r.password_strength_score:.0f}/100)")
+                if r.vulnerabilities:
+                    for vuln in r.vulnerabilities:
+                        sev_color = self.color.red if vuln.severity == "HIGH" else self.color.yellow
+                        print(f"    {sev_color(f'[{vuln.severity}]')} {vuln.cve} - {vuln.name}")
+                if r.fingerprint_info and r.fingerprint_info.software:
+                    print(f"    {self.color.dim('Software:')} {r.fingerprint_info.software} {r.fingerprint_info.software_version}")
+            print()
+
+        # Vulnerability summary (deduplicated)
+        all_vulns = {}
+        for r in self.results:
+            if r.vulnerabilities:
+                for v in r.vulnerabilities:
+                    all_vulns[v.cve] = v
+        if all_vulns:
+            print(f"\n{self.color.bold('VULNERABILITY FINDINGS:')}")
+            print("-" * 40)
+            for cve, v in sorted(all_vulns.items()):
+                sev_color = self.color.red if v.severity == "HIGH" else self.color.yellow
+                print(f"  {sev_color(f'[{v.severity}]')} {v.cve}: {v.name}")
+                print(f"    {self.color.dim(v.description)}")
             print()
 
     def _print_baseline_diff(self, diff: Dict[str, Any]):
@@ -2686,6 +3316,18 @@ Examples:
   %(prog)s -t 192.168.1.0/24 -u root -p pass --baseline prev.json --diff -o changes.json -f json
       Output only the differences from baseline scan
 
+  %(prog)s -t 192.168.1.1 -u admin -k ~/.ssh/id_rsa
+      Scan using SSH key authentication
+
+  %(prog)s -t 192.168.1.1 -C combos.txt
+      Scan using user:password combo file
+
+  %(prog)s -t 192.168.1.1 -u root -p pass --proxy socks5://127.0.0.1:9050
+      Scan through a SOCKS5 proxy (e.g., Tor)
+
+  %(prog)s -t 192.168.1.1 -u root -p pass --no-color
+      Scan with color output disabled (for piping/logging)
+
 Report bugs to: https://github.com/rom/sshcheck/issues
         """
     )
@@ -2769,6 +3411,40 @@ Report bugs to: https://github.com/rom/sshcheck/issues
         help='Also try the username as the password for each user.'
     )
 
+    # Key-based authentication
+    key_group = parser.add_argument_group('Key Authentication')
+    key_group.add_argument(
+        '-k', '--key',
+        action='append',
+        dest='key_files',
+        metavar='FILE',
+        help=(
+            'SSH private key file(s) for key-based authentication. '
+            'Supports RSA, Ed25519, ECDSA, and DSA keys. '
+            'Can be specified multiple times. Use -p for key passphrase.'
+        )
+    )
+    key_group.add_argument(
+        '-K', '--key-file',
+        metavar='FILE',
+        help=(
+            'File containing paths to SSH private key files (one per line). '
+            'Lines starting with # are treated as comments.'
+        )
+    )
+
+    # Combo file
+    combo_group = parser.add_argument_group('Combo File')
+    combo_group.add_argument(
+        '-C', '--combo-file',
+        metavar='FILE',
+        help=(
+            'File containing username:password combinations (one per line). '
+            'Format: username:password. Colons in passwords are supported. '
+            'Lines starting with # are treated as comments.'
+        )
+    )
+
     # Port specification
     port_group = parser.add_argument_group('Port Specification')
     port_group.add_argument(
@@ -2810,6 +3486,173 @@ Report bugs to: https://github.com/rom/sshcheck/issues
         '-q', '--quiet',
         action='store_true',
         help='Suppress progress output, only show summary.'
+    )
+    output_group.add_argument(
+        '--no-color',
+        action='store_true',
+        help='Disable colored output. Useful for piping output to files or non-terminal use.'
+    )
+
+    # Scan control options
+    scan_group = parser.add_argument_group('Scan Control')
+    scan_group.add_argument(
+        '--stop-on-success',
+        action='store_true',
+        help='Stop testing a host:port after the first successful login.'
+    )
+    scan_group.add_argument(
+        '--max-attempts-per-user',
+        type=int,
+        default=0,
+        metavar='NUM',
+        help=(
+            'Maximum failed password attempts per username per host before '
+            'skipping. Protects against account lockout. 0 = unlimited (default).'
+        )
+    )
+    scan_group.add_argument(
+        '-c', '--command',
+        metavar='CMD',
+        help='Execute command on successful login and capture output.'
+    )
+    scan_group.add_argument(
+        '--resume',
+        metavar='FILE',
+        help=(
+            'Resume scan from checkpoint file. The checkpoint file is '
+            'automatically saved during scanning.'
+        )
+    )
+    scan_group.add_argument(
+        '--checkpoint',
+        metavar='FILE',
+        help='Save scan progress to checkpoint file for resume support.'
+    )
+    scan_group.add_argument(
+        '--spray',
+        action='store_true',
+        help=(
+            'Enable credential spray mode. Tries one password across all '
+            'users/hosts before moving to the next password. Helps avoid '
+            'account lockouts in enterprise environments.'
+        )
+    )
+
+    # Target exclusion
+    exclude_group = parser.add_argument_group('Target Exclusion')
+    exclude_group.add_argument(
+        '--exclude',
+        action='append',
+        dest='exclude_hosts',
+        metavar='HOST',
+        help=(
+            'Host(s) to exclude from scanning. Accepts: single IP, '
+            'CIDR range, IP range, or hostname. Can be specified multiple times.'
+        )
+    )
+    exclude_group.add_argument(
+        '--exclude-file',
+        metavar='FILE',
+        help=(
+            'File containing hosts to exclude (one per line). '
+            'Same format as target files.'
+        )
+    )
+
+    # Security features
+    security_group = parser.add_argument_group('Security Features')
+    security_group.add_argument(
+        '--detect-honeypot',
+        action='store_true',
+        help=(
+            'Enable honeypot detection. Analyzes SSH banners, response '
+            'patterns, and behavior for signs of SSH honeypots (Cowrie, Kippo, etc.).'
+        )
+    )
+    security_group.add_argument(
+        '--known-hosts',
+        metavar='FILE',
+        help=(
+            'Check host keys against a known hosts file for MITM detection. '
+            'Supports OpenSSH known_hosts format and sshcheck JSON format. '
+            'Discovered keys are saved back to this file after scanning.'
+        )
+    )
+    security_group.add_argument(
+        '--baseline',
+        metavar='FILE',
+        help=(
+            'Compare scan results against a previous scan baseline (JSON). '
+            'Reports new/removed hosts, changed credentials, host key changes, '
+            'and SSH version changes.'
+        )
+    )
+
+    # Nmap integration
+    nmap_group = parser.add_argument_group('Nmap Integration')
+    nmap_group.add_argument(
+        '--import-nmap',
+        metavar='FILE',
+        help=(
+            'Import targets from an Nmap XML output file. Extracts hosts '
+            'with open SSH ports. Can be combined with -t for additional targets.'
+        )
+    )
+
+    # Source IP binding
+    network_group = parser.add_argument_group('Network Options')
+    network_group.add_argument(
+        '--source-ip',
+        metavar='IP',
+        help=(
+            'Bind to a specific source IP address for outgoing connections. '
+            'Useful for testing from different network interfaces or VLANs.'
+        )
+    )
+
+    # Service Discovery
+    discovery_group = parser.add_argument_group('Service Discovery')
+    discovery_group.add_argument(
+        '--scan-ports',
+        action='store_true',
+        help=(
+            'Discover SSH services before scanning. Performs a TCP connect '
+            'scan on common SSH ports (22, 2222, 2200, etc.) to find SSH '
+            'services. Discovered ports are added to the scan.'
+        )
+    )
+    discovery_group.add_argument(
+        '--discovery-ports',
+        metavar='PORTS',
+        help=(
+            'Comma-separated list of ports to check during service discovery. '
+            'Default: 22,2222,2200,22222,8022,830,222,2022,2220,10022'
+        )
+    )
+
+    # Differential output
+    diff_group = parser.add_argument_group('Differential Output')
+    diff_group.add_argument(
+        '--diff',
+        action='store_true',
+        dest='diff_mode',
+        help=(
+            'Enable differential/delta output mode. When used with --baseline, '
+            'the output file contains only changes between current and baseline '
+            'scans instead of the full report.'
+        )
+    )
+
+    # Password scoring
+    scoring_group = parser.add_argument_group('Password Analysis')
+    scoring_group.add_argument(
+        '--score-passwords',
+        action='store_true',
+        help=(
+            'Score password strength for successful logins. Evaluates length, '
+            'character diversity, common patterns, and entropy. Reports a '
+            '0-100 score with labels (very_weak, weak, moderate, strong, very_strong).'
+        )
     )
 
     # Scan control options
@@ -3001,6 +3844,18 @@ Report bugs to: https://github.com/rom/sshcheck/issues
         )
     )
 
+    # Proxy options
+    proxy_group = parser.add_argument_group('Proxy Options')
+    proxy_group.add_argument(
+        '--proxy',
+        metavar='URL',
+        help=(
+            'Route connections through a proxy. '
+            'Supported formats: socks5://host:port, socks4://host:port, http://host:port. '
+            'SOCKS proxy requires PySocks (pip install pysocks).'
+        )
+    )
+
     # Other options
     parser.add_argument(
         '-V', '--version',
@@ -3054,6 +3909,10 @@ def apply_config(args: argparse.Namespace, config: dict):
         'diff_mode': ('diff_mode', bool, False),
         'scan_ports': ('scan_ports', bool, False),
         'discovery_ports': ('discovery_ports', str, None),
+        'key_files': ('key_files', list, None),
+        'combo_file': ('combo_file', str, None),
+        'proxy': ('proxy', str, None),
+        'no_color': ('no_color', bool, False),
     }
 
     for config_key, (attr_name, expected_type, default) in mapping.items():
@@ -3149,10 +4008,11 @@ def main():
             print(str(e), file=sys.stderr)
             sys.exit(1)
 
-    if not users:
+    if not users and not args.combo_file:
         print(
             "ERROR: No usernames specified.\n"
-            "Please provide usernames using -u/--user or -U/--user-file options.\n"
+            "Please provide usernames using -u/--user or -U/--user-file options,\n"
+            "or use a combo file (-C).\n"
             "Use --help for usage information.",
             file=sys.stderr
         )
@@ -3170,11 +4030,40 @@ def main():
             print(str(e), file=sys.stderr)
             sys.exit(1)
 
-    if not passwords and not args.try_empty and not args.user_as_pass:
+    # Collect key files
+    key_files = []
+    if args.key_files:
+        key_files.extend(args.key_files)
+    if args.key_file:
+        try:
+            client = SSHAuditClient()
+            key_files.extend(client._read_file_lines(args.key_file, "key"))
+        except (FileNotFoundError, PermissionError, IOError) as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+
+    # Parse combo file
+    combo_list = []
+    if args.combo_file:
+        try:
+            client = SSHAuditClient()
+            combo_list = client._parse_combo_file(args.combo_file)
+        except (FileNotFoundError, PermissionError, IOError) as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+
+    # Validate: must have at least some credentials
+    has_password_creds = users and (passwords or args.try_empty or args.user_as_pass)
+    has_key_creds = key_files and users
+    has_combo_creds = bool(combo_list)
+
+    if not has_password_creds and not has_key_creds and not has_combo_creds:
         print(
-            "ERROR: No passwords specified.\n"
-            "Please provide passwords using -p/--password or -P/--password-file options,\n"
-            "or use --try-empty / --user-as-pass.\n"
+            "ERROR: No valid credentials specified.\n"
+            "Please provide at least one of:\n"
+            "  - Username (-u) and password (-p) combination\n"
+            "  - Username (-u) and key file (-k) combination\n"
+            "  - Combo file (-C) with user:password entries\n"
             "Use --help for usage information.",
             file=sys.stderr
         )
@@ -3289,6 +4178,20 @@ def main():
         )
         sys.exit(1)
 
+    # Validate proxy
+    if args.proxy:
+        proxy_str = args.proxy.strip()
+        if proxy_str.startswith(("socks4://", "socks5://", "socks5h://")) and not HAS_PYSOCKS:
+            print(
+                "ERROR: PySocks library is required for SOCKS proxy support.\n"
+                "Install it with: pip install pysocks",
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+    # Determine color setting
+    use_color = not args.no_color
+
     # Service discovery: scan for SSH ports before main scan
     if args.scan_ports:
         discovery_ports = None
@@ -3353,10 +4256,16 @@ def main():
         jitter=jitter_val,
         score_passwords=args.score_passwords,
         diff_mode=diff_mode,
+        color=use_color,
+        proxy=args.proxy,
     )
 
     try:
-        results = client.scan(targets, users, passwords, ports)
+        results = client.scan(
+            targets, users, passwords, ports,
+            key_files=key_files if key_files else None,
+            combo_list=combo_list if combo_list else None
+        )
 
         # Exit with appropriate code
         successful = [r for r in results if r.success]

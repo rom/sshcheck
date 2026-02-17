@@ -4,6 +4,9 @@ paramiko>=2.7.0
 # Optional: YAML config file support
 pyyaml>=5.0.0
 
+# Optional: SOCKS proxy support
+pysocks>=1.7.0
+
 # Test dependencies (optional)
 pytest>=6.0.0
 pytest-cov>=2.10.0

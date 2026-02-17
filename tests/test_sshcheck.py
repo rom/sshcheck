@@ -24,9 +24,15 @@ from sshcheck import (
     ScanResult,
     ScanStatistics,
     SeverityLevel,
+    FingerprintInfo,
+    VulnerabilityInfo,
+    ColorOutput,
+    ProgressBar,
     VULNERABLE_VERSIONS,
     WEAK_ALGORITHMS,
     OS_FINGERPRINTS,
+    SSH_FINGERPRINTS,
+    SSH_VULNERABILITIES,
     HONEYPOT_SIGNATURES,
     COMMON_PASSWORDS,
     COMMON_SSH_PORTS,
@@ -34,6 +40,10 @@ from sshcheck import (
     load_config_file,
     apply_config,
     _severity_rank,
+    _parse_version,
+    _version_lt,
+    _version_gte,
+    _version_in_range,
     __version__,
     __program_name__
 )
@@ -3134,10 +3144,9 @@ class TestConfigNewOptionsV4(unittest.TestCase):
 class TestVersionUpdate(unittest.TestCase):
     """Test version update."""
 
-    def test_version_is_4(self):
-        """Test that version is 4.0.0."""
-        self.assertEqual(__version__, "4.0.0")
-
+    def test_version_is_5(self):
+        """Test that version is 5.0.0."""
+        self.assertEqual(__version__, "5.0.0")
 
 class TestPasswordStrengthInProgress(unittest.TestCase):
     """Test password strength display in progress output."""
@@ -3364,6 +3373,564 @@ class TestOutputFormatCompleteness(unittest.TestCase):
         finally:
             os.unlink(tmp_path)
 
+class TestVersionHelpers(unittest.TestCase):
+    """Test version comparison helper functions."""
+
+    def test_parse_version_simple(self):
+        """Test parsing simple version strings."""
+        self.assertEqual(_parse_version("9.6"), (9, 6))
+        self.assertEqual(_parse_version("8.5"), (8, 5))
+        self.assertEqual(_parse_version("7.8"), (7, 8))
+
+    def test_parse_version_with_patch(self):
+        """Test parsing version with p suffix."""
+        self.assertEqual(_parse_version("9.6p2"), (9, 6, 2))
+        self.assertEqual(_parse_version("8.5p1"), (8, 5, 1))
+
+    def test_parse_version_three_part(self):
+        """Test parsing three-part versions."""
+        self.assertEqual(_parse_version("0.10.6"), (0, 10, 6))
+
+    def test_parse_version_invalid(self):
+        """Test parsing invalid version returns (0,)."""
+        self.assertEqual(_parse_version(""), (0,))
+        self.assertEqual(_parse_version("abc"), (0,))
+
+    def test_version_lt(self):
+        """Test version less than comparison."""
+        self.assertTrue(_version_lt("7.7", (7, 8)))
+        self.assertFalse(_version_lt("7.8", (7, 8)))
+        self.assertFalse(_version_lt("9.0", (7, 8)))
+
+    def test_version_gte(self):
+        """Test version greater than or equal comparison."""
+        self.assertTrue(_version_gte("9.6", (9, 6)))
+        self.assertTrue(_version_gte("9.7", (9, 6)))
+        self.assertFalse(_version_gte("9.5", (9, 6)))
+
+    def test_version_in_range(self):
+        """Test version in range check."""
+        self.assertTrue(_version_in_range("8.6", (8, 5), (9, 7)))
+        self.assertTrue(_version_in_range("8.5", (8, 5), (9, 7)))
+        self.assertTrue(_version_in_range("9.7", (8, 5), (9, 7)))
+        self.assertFalse(_version_in_range("8.4", (8, 5), (9, 7)))
+        self.assertFalse(_version_in_range("9.8", (8, 5), (9, 7)))
+
+
+class TestColorOutput(unittest.TestCase):
+    """Test ColorOutput class."""
+
+    def test_color_enabled(self):
+        """Test that color codes are included when enabled."""
+        color = ColorOutput(enabled=True)
+        # Force enabled since we may not be in a terminal
+        color.enabled = True
+        result = color.green("test")
+        self.assertIn("test", result)
+        self.assertIn("\033[92m", result)
+
+    def test_color_disabled(self):
+        """Test that color codes are not included when disabled."""
+        color = ColorOutput(enabled=False)
+        self.assertEqual(color.green("test"), "test")
+        self.assertEqual(color.red("test"), "test")
+        self.assertEqual(color.yellow("test"), "test")
+        self.assertEqual(color.cyan("test"), "test")
+        self.assertEqual(color.bold("test"), "test")
+        self.assertEqual(color.dim("test"), "test")
+
+    def test_all_color_methods(self):
+        """Test all color methods produce output."""
+        color = ColorOutput(enabled=True)
+        color.enabled = True
+        for method_name in ['green', 'red', 'yellow', 'cyan', 'bold', 'dim']:
+            method = getattr(color, method_name)
+            result = method("hello")
+            self.assertIn("hello", result)
+            self.assertIn("\033[", result)
+
+
+class TestProgressBar(unittest.TestCase):
+    """Test ProgressBar class."""
+
+    def test_progress_bar_creation(self):
+        """Test creating a progress bar."""
+        color = ColorOutput(enabled=False)
+        pb = ProgressBar(100, color)
+        self.assertEqual(pb.total, 100)
+
+    def test_format_time_seconds(self):
+        """Test time formatting for short durations."""
+        color = ColorOutput(enabled=False)
+        pb = ProgressBar(100, color)
+        self.assertEqual(pb._format_time(65), "1:05")
+        self.assertEqual(pb._format_time(0), "0:00")
+
+    def test_format_time_hours(self):
+        """Test time formatting for long durations."""
+        color = ColorOutput(enabled=False)
+        pb = ProgressBar(100, color)
+        self.assertEqual(pb._format_time(3661), "1:01:01")
+
+    def test_format_time_negative(self):
+        """Test time formatting for negative values."""
+        color = ColorOutput(enabled=False)
+        pb = ProgressBar(100, color)
+        self.assertEqual(pb._format_time(-1), "--:--")
+
+    def test_progress_bar_update(self):
+        """Test progress bar update writes to stdout."""
+        color = ColorOutput(enabled=False)
+        pb = ProgressBar(100, color)
+        with patch('sys.stdout', new_callable=StringIO) as mock_out:
+            pb.update(50, "testing")
+            output = mock_out.getvalue()
+            self.assertIn("50.0%", output)
+            self.assertIn("50/100", output)
+
+    def test_progress_bar_finish(self):
+        """Test progress bar finish."""
+        color = ColorOutput(enabled=False)
+        pb = ProgressBar(10, color)
+        with patch('sys.stdout', new_callable=StringIO) as mock_out:
+            pb.finish()
+            output = mock_out.getvalue()
+            self.assertIn("100.0%", output)
+            self.assertIn("Done!", output)
+
+
+class TestFingerprintInfo(unittest.TestCase):
+    """Test FingerprintInfo dataclass."""
+
+    def test_default_creation(self):
+        """Test creating FingerprintInfo with defaults."""
+        info = FingerprintInfo()
+        self.assertEqual(info.software, "")
+        self.assertEqual(info.software_version, "")
+        self.assertEqual(info.os_guess, "")
+
+    def test_to_dict(self):
+        """Test conversion to dictionary."""
+        info = FingerprintInfo(software="OpenSSH", software_version="9.6", os_guess="Ubuntu")
+        d = info.to_dict()
+        self.assertEqual(d['software'], "OpenSSH")
+        self.assertEqual(d['software_version'], "9.6")
+        self.assertEqual(d['os_guess'], "Ubuntu")
+
+
+class TestVulnerabilityInfo(unittest.TestCase):
+    """Test VulnerabilityInfo dataclass."""
+
+    def test_default_creation(self):
+        """Test creating VulnerabilityInfo with defaults."""
+        vuln = VulnerabilityInfo()
+        self.assertEqual(vuln.cve, "")
+        self.assertEqual(vuln.severity, "")
+
+    def test_to_dict(self):
+        """Test conversion to dictionary."""
+        vuln = VulnerabilityInfo(
+            cve="CVE-2024-6387",
+            name="regreSSHion",
+            severity="HIGH"
+        )
+        d = vuln.to_dict()
+        self.assertEqual(d['cve'], "CVE-2024-6387")
+        self.assertEqual(d['name'], "regreSSHion")
+
+
+class TestScanResultNewFieldsV5(unittest.TestCase):
+    """Test new ScanResult fields added in v5."""
+
+    def test_auth_method_default(self):
+        """Test auth_method defaults to 'password'."""
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="pass", success=True, timestamp="2026-01-01T12:00:00"
+        )
+        self.assertEqual(result.auth_method, "password")
+        self.assertEqual(result.key_file, "")
+
+    def test_key_file_field(self):
+        """Test key_file field."""
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="", success=True, timestamp="2026-01-01T12:00:00",
+            auth_method="key", key_file="/home/user/.ssh/id_rsa"
+        )
+        self.assertEqual(result.auth_method, "key")
+        self.assertEqual(result.key_file, "/home/user/.ssh/id_rsa")
+
+    def test_fingerprint_info_default(self):
+        """Test fingerprint_info defaults to None."""
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="pass", success=True, timestamp="2026-01-01T12:00:00"
+        )
+        self.assertIsNone(result.fingerprint_info)
+
+    def test_vulnerabilities_default(self):
+        """Test vulnerabilities defaults to None."""
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="pass", success=True, timestamp="2026-01-01T12:00:00"
+        )
+        self.assertIsNone(result.vulnerabilities)
+
+    def test_to_dict_new_fields(self):
+        """Test to_dict includes new fields with proper defaults."""
+        result = ScanResult(
+            host="10.0.0.1", port=22, username="root",
+            password="pass", success=True, timestamp="2026-01-01T12:00:00"
+        )
+        d = result.to_dict()
+        self.assertEqual(d['auth_method'], "password")
+        self.assertEqual(d['key_file'], "")
+        self.assertEqual(d['fingerprint_info'], {})
+        self.assertEqual(d['vulnerabilities'], [])
+
+
+class TestFingerprintBanner(unittest.TestCase):
+    """Test the enhanced _fingerprint_banner method."""
+
+    def test_openssh_ubuntu_banner(self):
+        """Test fingerprinting OpenSSH on Ubuntu."""
+        client = SSHAuditClient()
+        info = client._fingerprint_banner("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13")
+        self.assertEqual(info.software, "OpenSSH")
+        self.assertEqual(info.software_version, "9.6p1")
+        self.assertIn("Ubuntu", info.os_guess)
+
+    def test_openssh_debian_banner(self):
+        """Test fingerprinting OpenSSH on Debian."""
+        client = SSHAuditClient()
+        info = client._fingerprint_banner("SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3")
+        self.assertEqual(info.software, "OpenSSH")
+        self.assertIn("Debian", info.os_guess)
+
+    def test_dropbear_banner(self):
+        """Test fingerprinting Dropbear SSH."""
+        client = SSHAuditClient()
+        info = client._fingerprint_banner("SSH-2.0-dropbear_2022.83")
+        self.assertEqual(info.software, "Dropbear")
+        self.assertEqual(info.software_version, "2022.83")
+
+    def test_generic_openssh_banner(self):
+        """Test fingerprinting generic OpenSSH banner."""
+        client = SSHAuditClient()
+        info = client._fingerprint_banner("SSH-2.0-OpenSSH_8.9")
+        self.assertEqual(info.software, "OpenSSH")
+        self.assertEqual(info.software_version, "8.9")
+
+    def test_empty_banner(self):
+        """Test fingerprinting empty banner."""
+        client = SSHAuditClient()
+        info = client._fingerprint_banner("")
+        self.assertEqual(info.software, "")
+        self.assertEqual(info.software_version, "")
+
+    def test_protocol_version_extracted(self):
+        """Test protocol version extraction."""
+        client = SSHAuditClient()
+        info = client._fingerprint_banner("SSH-2.0-OpenSSH_9.6")
+        self.assertEqual(info.protocol_version, "2.0")
+
+
+class TestCheckVulnerabilities(unittest.TestCase):
+    """Test the _check_vulnerabilities method."""
+
+    def test_regress_hion_affected(self):
+        """Test regreSSHion CVE-2024-6387 detection."""
+        client = SSHAuditClient()
+        fp = FingerprintInfo(software="OpenSSH", software_version="9.5p1")
+        vulns = client._check_vulnerabilities(fp)
+        cves = [v.cve for v in vulns]
+        self.assertIn("CVE-2024-6387", cves)
+
+    def test_regress_hion_not_affected(self):
+        """Test regreSSHion not flagged for patched version."""
+        client = SSHAuditClient()
+        fp = FingerprintInfo(software="OpenSSH", software_version="9.8")
+        vulns = client._check_vulnerabilities(fp)
+        cves = [v.cve for v in vulns]
+        self.assertNotIn("CVE-2024-6387", cves)
+
+    def test_terrapin_affected(self):
+        """Test Terrapin CVE-2023-48795 detection."""
+        client = SSHAuditClient()
+        fp = FingerprintInfo(software="OpenSSH", software_version="9.5")
+        vulns = client._check_vulnerabilities(fp)
+        cves = [v.cve for v in vulns]
+        self.assertIn("CVE-2023-48795", cves)
+
+    def test_terrapin_not_affected(self):
+        """Test Terrapin not flagged for 9.6+."""
+        client = SSHAuditClient()
+        fp = FingerprintInfo(software="OpenSSH", software_version="9.6")
+        vulns = client._check_vulnerabilities(fp)
+        cves = [v.cve for v in vulns]
+        self.assertNotIn("CVE-2023-48795", cves)
+
+    def test_username_enumeration_old(self):
+        """Test username enumeration CVE-2018-15473 for old OpenSSH."""
+        client = SSHAuditClient()
+        fp = FingerprintInfo(software="OpenSSH", software_version="7.7")
+        vulns = client._check_vulnerabilities(fp)
+        cves = [v.cve for v in vulns]
+        self.assertIn("CVE-2018-15473", cves)
+
+    def test_no_vulns_empty_fingerprint(self):
+        """Test no vulnerabilities for empty fingerprint."""
+        client = SSHAuditClient()
+        fp = FingerprintInfo()
+        vulns = client._check_vulnerabilities(fp)
+        self.assertEqual(len(vulns), 0)
+
+    def test_dropbear_terrapin(self):
+        """Test Dropbear Terrapin detection."""
+        client = SSHAuditClient()
+        fp = FingerprintInfo(software="Dropbear", software_version="2020.81")
+        vulns = client._check_vulnerabilities(fp)
+        cves = [v.cve for v in vulns]
+        self.assertIn("CVE-2023-48795", cves)
+
+
+class TestComboFileParsing(unittest.TestCase):
+    """Test combo file parsing."""
+
+    def test_parse_combo_file(self):
+        """Test parsing a valid combo file."""
+        client = SSHAuditClient()
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write("root:password\n")
+            f.write("admin:admin123\n")
+            f.write("# comment line\n")
+            f.write("user:p@ss:w0rd\n")
+            tmp_path = f.name
+        try:
+            combos = client._parse_combo_file(tmp_path)
+            self.assertEqual(len(combos), 3)
+            self.assertEqual(combos[0], ("root", "password"))
+            self.assertEqual(combos[1], ("admin", "admin123"))
+            self.assertEqual(combos[2], ("user", "p@ss:w0rd"))
+        finally:
+            os.unlink(tmp_path)
+
+    def test_parse_combo_file_empty_lines(self):
+        """Test combo file with empty lines."""
+        client = SSHAuditClient()
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write("root:pass\n")
+            f.write("\n")
+            f.write("admin:admin\n")
+            tmp_path = f.name
+        try:
+            combos = client._parse_combo_file(tmp_path)
+            self.assertEqual(len(combos), 2)
+        finally:
+            os.unlink(tmp_path)
+
+
+class TestProxyParsing(unittest.TestCase):
+    """Test proxy URL parsing."""
+
+    def test_socks5_proxy(self):
+        """Test SOCKS5 proxy parsing."""
+        client = SSHAuditClient(proxy="socks5://127.0.0.1:9050")
+        self.assertEqual(client._proxy_type, "socks5")
+        self.assertEqual(client._proxy_host, "127.0.0.1")
+        self.assertEqual(client._proxy_port, 9050)
+
+    def test_socks4_proxy(self):
+        """Test SOCKS4 proxy parsing."""
+        client = SSHAuditClient(proxy="socks4://proxy.local:1080")
+        self.assertEqual(client._proxy_type, "socks4")
+        self.assertEqual(client._proxy_host, "proxy.local")
+        self.assertEqual(client._proxy_port, 1080)
+
+    def test_http_proxy(self):
+        """Test HTTP proxy parsing."""
+        client = SSHAuditClient(proxy="http://proxy.example.com:8080")
+        self.assertEqual(client._proxy_type, "http")
+        self.assertEqual(client._proxy_host, "proxy.example.com")
+        self.assertEqual(client._proxy_port, 8080)
+
+    def test_no_proxy(self):
+        """Test no proxy configured."""
+        client = SSHAuditClient()
+        self.assertIsNone(client._proxy_type)
+        self.assertIsNone(client._proxy_host)
+        self.assertIsNone(client._proxy_port)
+
+    def test_default_socks_port(self):
+        """Test default port for bare socks5 proxy."""
+        client = SSHAuditClient(proxy="socks5://127.0.0.1")
+        self.assertEqual(client._proxy_port, 1080)
+
+    def test_default_http_port(self):
+        """Test default port for bare HTTP proxy."""
+        client = SSHAuditClient(proxy="http://proxy.local")
+        self.assertEqual(client._proxy_port, 8080)
+
+
+class TestKeyLoading(unittest.TestCase):
+    """Test SSH key loading functionality."""
+
+    def test_load_private_key_missing_file(self):
+        """Test loading a non-existent key file raises error."""
+        client = SSHAuditClient()
+        with self.assertRaises(FileNotFoundError):
+            client._load_private_key("/nonexistent/key/file")
+
+    def test_load_private_key_directory(self):
+        """Test loading a directory as key file raises error."""
+        client = SSHAuditClient()
+        with self.assertRaises(ValueError):
+            client._load_private_key(tempfile.gettempdir())
+
+
+class TestNewArgumentsV5(unittest.TestCase):
+    """Test new CLI arguments added in v5."""
+
+    def test_key_argument(self):
+        """Test -k argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-u', 'root', '-k', '/tmp/key']):
+            args = parse_arguments()
+            self.assertEqual(args.key_files, ['/tmp/key'])
+
+    def test_key_file_argument(self):
+        """Test -K argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-u', 'root', '-K', '/tmp/keys.txt']):
+            args = parse_arguments()
+            self.assertEqual(args.key_file, '/tmp/keys.txt')
+
+    def test_combo_file_argument(self):
+        """Test -C argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-C', '/tmp/combos.txt']):
+            args = parse_arguments()
+            self.assertEqual(args.combo_file, '/tmp/combos.txt')
+
+    def test_proxy_argument(self):
+        """Test --proxy argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-u', 'root', '-p', 'pass',
+                                '--proxy', 'socks5://127.0.0.1:9050']):
+            args = parse_arguments()
+            self.assertEqual(args.proxy, 'socks5://127.0.0.1:9050')
+
+    def test_no_color_argument(self):
+        """Test --no-color argument parsing."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-u', 'root', '-p', 'pass',
+                                '--no-color']):
+            args = parse_arguments()
+            self.assertTrue(args.no_color)
+
+    def test_no_color_default_false(self):
+        """Test --no-color defaults to False."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-u', 'root', '-p', 'pass']):
+            args = parse_arguments()
+            self.assertFalse(args.no_color)
+
+    def test_multiple_keys(self):
+        """Test multiple -k arguments."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-u', 'root',
+                                '-k', '/tmp/key1', '-k', '/tmp/key2']):
+            args = parse_arguments()
+            self.assertEqual(len(args.key_files), 2)
+
+
+class TestSSHVulnerabilityDatabase(unittest.TestCase):
+    """Test the SSH vulnerability database structure."""
+
+    def test_openssh_vulns_exist(self):
+        """Test OpenSSH entries exist in vulnerability database."""
+        self.assertIn("OpenSSH", SSH_VULNERABILITIES)
+        self.assertTrue(len(SSH_VULNERABILITIES["OpenSSH"]) > 0)
+
+    def test_dropbear_vulns_exist(self):
+        """Test Dropbear entries exist in vulnerability database."""
+        self.assertIn("Dropbear", SSH_VULNERABILITIES)
+
+    def test_libssh_vulns_exist(self):
+        """Test libssh entries exist in vulnerability database."""
+        self.assertIn("libssh", SSH_VULNERABILITIES)
+
+    def test_vuln_entries_have_required_fields(self):
+        """Test all vulnerability entries have required fields."""
+        for software, vulns in SSH_VULNERABILITIES.items():
+            for vuln in vulns:
+                self.assertIn("cve", vuln, f"Missing 'cve' in {software} vuln")
+                self.assertIn("name", vuln, f"Missing 'name' in {software} vuln")
+                self.assertIn("severity", vuln, f"Missing 'severity' in {software} vuln")
+                self.assertIn("check", vuln, f"Missing 'check' in {software} vuln")
+                self.assertTrue(callable(vuln["check"]),
+                                f"'check' is not callable in {vuln['cve']}")
+
+
+class TestSSHFingerprints(unittest.TestCase):
+    """Test the SSH fingerprint patterns."""
+
+    def test_fingerprint_patterns_are_tuples(self):
+        """Test all fingerprint entries are 3-tuples."""
+        for entry in SSH_FINGERPRINTS:
+            self.assertEqual(len(entry), 3,
+                             f"Fingerprint entry should be 3-tuple: {entry}")
+
+    def test_fingerprint_patterns_compile(self):
+        """Test all fingerprint regex patterns compile."""
+        import re
+        for pattern, software, os_guess in SSH_FINGERPRINTS:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                self.fail(f"Invalid regex pattern '{pattern}': {e}")
+
+
+class TestColorClientInit(unittest.TestCase):
+    """Test SSHAuditClient color initialization."""
+
+    def test_color_enabled_by_default(self):
+        """Test color is enabled by default (may be False if not a tty)."""
+        client = SSHAuditClient()
+        self.assertIsInstance(client.color, ColorOutput)
+
+    def test_color_disabled(self):
+        """Test color can be explicitly disabled."""
+        client = SSHAuditClient(color=False)
+        self.assertFalse(client.color.enabled)
+
+    def test_proxy_none_by_default(self):
+        """Test proxy is None by default."""
+        client = SSHAuditClient()
+        self.assertIsNone(client.proxy)
+        self.assertIsNone(client._proxy_type)
+
+
+class TestConfigNewOptionsV5(unittest.TestCase):
+    """Test config file handling for v5 options."""
+
+    def test_apply_config_proxy(self):
+        """Test proxy is applied from config."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-u', 'root', '-p', 'pass']):
+            args = parse_arguments()
+        config = {'proxy': 'socks5://127.0.0.1:9050'}
+        apply_config(args, config)
+        self.assertEqual(args.proxy, 'socks5://127.0.0.1:9050')
+
+    def test_apply_config_no_color(self):
+        """Test no_color is applied from config."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-u', 'root', '-p', 'pass']):
+            args = parse_arguments()
+        config = {'no_color': True}
+        apply_config(args, config)
+        self.assertTrue(args.no_color)
+
+    def test_apply_config_key_files(self):
+        """Test key_files is applied from config."""
+        with patch('sys.argv', ['sshcheck', '-t', '1.2.3.4', '-u', 'root', '-p', 'pass']):
+            args = parse_arguments()
+        config = {'key_files': ['/tmp/key1', '/tmp/key2']}
+        apply_config(args, config)
+        self.assertEqual(args.key_files, ['/tmp/key1', '/tmp/key2'])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

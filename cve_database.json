@@ -1,0 +1,155 @@
+{
+  "_comment": "sshcheck CVE database — external version of SSH_VULNERABILITIES in sshcheck.py. Each entry uses a serialisable 'version_check' dict instead of a Python lambda. Supported check types: range, range_exclude, lt, gte, always_false.",
+  "OpenSSH": [
+    {
+      "cve": "CVE-2024-6387",
+      "name": "regreSSHion",
+      "severity": "HIGH",
+      "affected": "OpenSSH 8.5p1 - 9.7p1 (except 9.6p2+)",
+      "description": "Race condition in signal handler allows unauthenticated remote code execution",
+      "version_check": {
+        "type": "range_exclude",
+        "low": [8, 5],
+        "high": [9, 7],
+        "exclude_gte": [9, 6, 2]
+      }
+    },
+    {
+      "cve": "CVE-2023-51385",
+      "name": "OS command injection via ssh and ssh-keygen",
+      "severity": "MEDIUM",
+      "affected": "OpenSSH < 9.6",
+      "description": "OS command injection via expansion tokens in certain conditions",
+      "version_check": {
+        "type": "lt",
+        "target": [9, 6]
+      }
+    },
+    {
+      "cve": "CVE-2023-48795",
+      "name": "Terrapin Attack",
+      "severity": "MEDIUM",
+      "affected": "OpenSSH < 9.6",
+      "description": "Prefix truncation attack on Binary Packet Protocol (BPP) with ChaCha20-Poly1305 or CBC with Encrypt-then-MAC",
+      "version_check": {
+        "type": "lt",
+        "target": [9, 6]
+      }
+    },
+    {
+      "cve": "CVE-2023-38408",
+      "name": "Remote code execution via ssh-agent forwarding",
+      "severity": "HIGH",
+      "affected": "OpenSSH < 9.3p2",
+      "description": "Remote code execution via PKCS#11 providers in forwarded ssh-agent",
+      "version_check": {
+        "type": "lt",
+        "target": [9, 3, 2]
+      }
+    },
+    {
+      "cve": "CVE-2021-41617",
+      "name": "Privilege escalation via AuthorizedKeysCommand/AuthorizedPrincipalsCommand",
+      "severity": "HIGH",
+      "affected": "OpenSSH 6.2 - 8.7",
+      "description": "sshd allows privilege escalation because supplemental groups are not initialized as expected",
+      "version_check": {
+        "type": "range",
+        "low": [6, 2],
+        "high": [8, 7]
+      }
+    },
+    {
+      "cve": "CVE-2020-15778",
+      "name": "Command injection via scp",
+      "severity": "HIGH",
+      "affected": "OpenSSH < 9.0",
+      "description": "Command injection via backtick characters in scp target filenames",
+      "version_check": {
+        "type": "lt",
+        "target": [9, 0]
+      }
+    },
+    {
+      "cve": "CVE-2019-6111",
+      "name": "SCP client spoofing via object name",
+      "severity": "MEDIUM",
+      "affected": "OpenSSH < 8.0",
+      "description": "SCP client allows server to write arbitrary files via modified object names",
+      "version_check": {
+        "type": "lt",
+        "target": [8, 0]
+      }
+    },
+    {
+      "cve": "CVE-2018-15473",
+      "name": "Username enumeration",
+      "severity": "MEDIUM",
+      "affected": "OpenSSH < 7.8",
+      "description": "User enumeration via malformed authentication requests",
+      "version_check": {
+        "type": "lt",
+        "target": [7, 8]
+      }
+    },
+    {
+      "cve": "CVE-2016-20012",
+      "name": "Username enumeration via auth timing",
+      "severity": "LOW",
+      "affected": "OpenSSH < 8.8",
+      "description": "Allows remote attackers to enumerate valid usernames via timing differences",
+      "version_check": {
+        "type": "lt",
+        "target": [8, 8]
+      }
+    }
+  ],
+  "Dropbear": [
+    {
+      "cve": "CVE-2023-48795",
+      "name": "Terrapin Attack",
+      "severity": "MEDIUM",
+      "affected": "Dropbear < 2022.83+",
+      "description": "Prefix truncation attack on Binary Packet Protocol",
+      "version_check": {
+        "type": "lt",
+        "target": [2022, 83]
+      }
+    },
+    {
+      "cve": "CVE-2021-36369",
+      "name": "Trivial authentication bypass",
+      "severity": "HIGH",
+      "affected": "Dropbear < 2022.82",
+      "description": "Allows trivial authentication when no login credentials are configured",
+      "version_check": {
+        "type": "lt",
+        "target": [2022, 82]
+      }
+    }
+  ],
+  "libssh": [
+    {
+      "cve": "CVE-2023-48795",
+      "name": "Terrapin Attack",
+      "severity": "MEDIUM",
+      "affected": "libssh < 0.10.6 / 0.9.8",
+      "description": "Prefix truncation attack on Binary Packet Protocol",
+      "version_check": {
+        "type": "lt",
+        "target": [0, 10, 6]
+      }
+    },
+    {
+      "cve": "CVE-2023-6004",
+      "name": "ProxyCommand/ProxyJump command injection",
+      "severity": "LOW",
+      "affected": "libssh < 0.10.6 / 0.9.8",
+      "description": "Command injection via hostname with ProxyCommand/ProxyJump",
+      "version_check": {
+        "type": "lt",
+        "target": [0, 10, 6]
+      }
+    }
+  ]
+}

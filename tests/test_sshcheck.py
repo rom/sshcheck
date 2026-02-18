@@ -616,39 +616,50 @@ class TestSSHAuditClientConnection(unittest.TestCase):
         """Set up test fixtures."""
         self.client = SSHAuditClient(timeout=5)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_successful_login(self, mock_ssh_class):
-        """Test successful SSH login."""
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-
-        # Mock successful connection
-        mock_client.connect.return_value = None
-
-        # Mock transport for host key and algorithm info
+    def _make_mock_transport(self):
+        """Create a mock paramiko.Transport for use in connection tests."""
         mock_transport = MagicMock()
         mock_key = MagicMock()
         mock_key.get_name.return_value = "ssh-ed25519"
         mock_key.asbytes.return_value = b"fake_key_bytes"
         mock_key.get_bits.return_value = 256
         mock_transport.get_remote_server_key.return_value = mock_key
-
         mock_sec_opts = MagicMock()
         mock_sec_opts.kex = ["curve25519-sha256"]
         mock_sec_opts.ciphers = ["aes256-gcm@openssh.com"]
         mock_sec_opts.digests = ["hmac-sha2-256"]
         mock_sec_opts.key_types = ["ssh-ed25519"]
         mock_transport.get_security_options.return_value = mock_sec_opts
+        mock_transport.is_active.return_value = True
+        mock_transport.auth_password.return_value = []
+        mock_transport.auth_publickey.return_value = []
+        return mock_transport
 
-        mock_client.get_transport.return_value = mock_transport
+    def test_successful_login(self):
+        """Test successful SSH login."""
+        mock_transport = self._make_mock_transport()
 
         # Mock channel for initial output
         mock_channel = MagicMock()
         mock_channel.recv_ready.side_effect = [True, False]
         mock_channel.recv.return_value = b"Welcome to the server\n"
-        mock_client.invoke_shell.return_value = mock_channel
+        mock_transport.open_session.return_value = mock_channel
 
-        with patch.object(self.client, '_get_ssh_banner', return_value="SSH-2.0-OpenSSH_8.9p1 Ubuntu-3"):
+        mock_probe = MagicMock()
+        mock_probe.banner = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3"
+        mock_probe.os_info = "Ubuntu Linux"
+        mock_probe.os_family = "Linux"
+        mock_probe.ssh_version = "OpenSSH_8.9p1 Ubuntu-3"
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = "ssh-ed25519"
+        mock_probe.host_key_fingerprint = "SHA256:fakefingerprint"
+        mock_probe.host_key_bits = 256
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        with patch.object(self.client, '_probe_host', return_value=mock_probe), \
+             patch.object(self.client, '_get_or_create_transport', return_value=mock_transport):
             result = self.client._try_login("192.168.1.1", 22, "admin", "password")
 
         self.assertTrue(result.success)
@@ -660,101 +671,143 @@ class TestSSHAuditClientConnection(unittest.TestCase):
         self.assertEqual(result.os_info, "Ubuntu Linux")
         self.assertEqual(result.os_family, "Linux")
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_successful_login_with_command(self, mock_ssh_class):
+    def test_successful_login_with_command(self):
         """Test successful SSH login with command execution."""
         self.client.command = "id"
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.return_value = None
+        mock_transport = self._make_mock_transport()
 
-        mock_transport = MagicMock()
-        mock_key = MagicMock()
-        mock_key.get_name.return_value = "ssh-ed25519"
-        mock_key.asbytes.return_value = b"fake_key_bytes"
-        mock_key.get_bits.return_value = 256
-        mock_transport.get_remote_server_key.return_value = mock_key
-        mock_sec_opts = MagicMock()
-        mock_sec_opts.kex = []
-        mock_sec_opts.ciphers = []
-        mock_sec_opts.digests = []
-        mock_sec_opts.key_types = []
-        mock_transport.get_security_options.return_value = mock_sec_opts
-        mock_client.get_transport.return_value = mock_transport
+        # Mock channel for exec_command
+        mock_channel = MagicMock()
+        mock_channel.recv.side_effect = [b"uid=0(root) gid=0(root)\n", b""]
+        mock_channel.recv_stderr_ready.return_value = False
+        mock_transport.open_session.return_value = mock_channel
 
-        # Mock exec_command
-        mock_stdout = MagicMock()
-        mock_stdout.read.return_value = b"uid=0(root) gid=0(root)\n"
-        mock_stderr = MagicMock()
-        mock_stderr.read.return_value = b""
-        mock_client.exec_command.return_value = (MagicMock(), mock_stdout, mock_stderr)
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
 
-        with patch.object(self.client, '_get_ssh_banner', return_value=""):
+        with patch.object(self.client, '_probe_host', return_value=mock_probe), \
+             patch.object(self.client, '_get_or_create_transport', return_value=mock_transport):
             result = self.client._try_login("192.168.1.1", 22, "root", "pass")
 
         self.assertTrue(result.success)
         self.assertIn("uid=0(root)", result.command_output)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_authentication_failure(self, mock_ssh_class):
+    def test_authentication_failure(self):
         """Test authentication failure."""
         import paramiko
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
+        mock_transport = MagicMock()
+        mock_transport.is_active.return_value = True
+        mock_transport.auth_password.side_effect = paramiko.AuthenticationException("Auth failed")
 
-        # Mock authentication failure
-        mock_client.connect.side_effect = paramiko.AuthenticationException("Auth failed")
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
 
-        with patch.object(self.client, '_get_ssh_banner', return_value=""):
+        with patch.object(self.client, '_probe_host', return_value=mock_probe), \
+             patch.object(self.client, '_get_or_create_transport', return_value=mock_transport):
             result = self.client._try_login("192.168.1.1", 22, "admin", "wrongpass")
 
         self.assertFalse(result.success)
         self.assertIn("Authentication failed", result.error_message)
         self.assertEqual(self.client.stats.authentication_errors, 1)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_authentication_failure_tracks_lockout(self, mock_ssh_class):
+    def test_authentication_failure_tracks_lockout(self):
         """Test that auth failure increments lockout counter."""
         import paramiko
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = paramiko.AuthenticationException("Auth failed")
+        mock_transport = MagicMock()
+        mock_transport.is_active.return_value = True
+        mock_transport.auth_password.side_effect = paramiko.AuthenticationException("Auth failed")
 
-        with patch.object(self.client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        with patch.object(self.client, '_probe_host', return_value=mock_probe), \
+             patch.object(self.client, '_get_or_create_transport', return_value=mock_transport):
             self.client._try_login("192.168.1.1", 22, "root", "wrongpass")
 
         self.assertEqual(self.client._failure_counts["192.168.1.1:22:root"], 1)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_connection_timeout(self, mock_ssh_class):
+    def test_connection_timeout(self):
         """Test connection timeout."""
         import socket
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
+        mock_transport = MagicMock()
+        mock_transport.is_active.return_value = True
+        mock_transport.auth_password.side_effect = socket.timeout()
 
-        # Mock timeout
-        mock_client.connect.side_effect = socket.timeout()
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
 
-        with patch.object(self.client, '_get_ssh_banner', return_value=""):
+        with patch.object(self.client, '_probe_host', return_value=mock_probe), \
+             patch.object(self.client, '_get_or_create_transport', return_value=mock_transport):
             result = self.client._try_login("192.168.1.1", 22, "admin", "password")
 
         self.assertFalse(result.success)
         self.assertIn("timed out", result.error_message)
         self.assertEqual(self.client.stats.timeout_errors, 1)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_connection_refused(self, mock_ssh_class):
+    def test_connection_refused(self):
         """Test connection refused error."""
         import socket
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-
-        # Mock connection refused
         error = socket.error()
         error.errno = 111
-        mock_client.connect.side_effect = error
+        mock_transport = MagicMock()
+        mock_transport.is_active.return_value = True
+        mock_transport.auth_password.side_effect = error
 
-        with patch.object(self.client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        with patch.object(self.client, '_probe_host', return_value=mock_probe), \
+             patch.object(self.client, '_get_or_create_transport', return_value=mock_transport):
             result = self.client._try_login("192.168.1.1", 22, "admin", "password")
 
         self.assertFalse(result.success)
@@ -1243,8 +1296,7 @@ class TestIntegration(unittest.TestCase):
         import shutil
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_full_scan_with_file_inputs(self, mock_ssh_class):
+    def test_full_scan_with_file_inputs(self):
         """Test full scan using file inputs."""
         # Create test files
         targets_file = os.path.join(self.temp_dir, "targets.txt")
@@ -1259,18 +1311,31 @@ class TestIntegration(unittest.TestCase):
         with open(passwords_file, 'w') as f:
             f.write("password123\nadmin\n")
 
-        # Mock SSH client
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = Exception("Connection failed")
-
         client = SSHAuditClient(output_file=output_file, output_format='json')
 
         targets = client._read_file_lines(targets_file, "targets")
         users = client._read_file_lines(users_file, "users")
         passwords = client._read_file_lines(passwords_file, "passwords")
 
-        with patch.object(client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        mock_transport = MagicMock()
+        mock_transport.auth_password.side_effect = Exception("Connection failed")
+        mock_transport.is_active.return_value = True
+
+        with patch.object(client, '_probe_host', return_value=mock_probe), \
+             patch.object(client, '_get_or_create_transport', return_value=mock_transport):
             # Capture stdout
             with patch('sys.stdout', new_callable=StringIO):
                 results = client.scan(targets, users, passwords, [22])
@@ -1282,16 +1347,29 @@ class TestIntegration(unittest.TestCase):
         # Check output file was created
         self.assertTrue(os.path.exists(output_file))
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_scan_with_multiple_ports(self, mock_ssh_class):
+    def test_scan_with_multiple_ports(self):
         """Test scanning with multiple ports."""
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = Exception("Connection failed")
-
         client = SSHAuditClient()
 
-        with patch.object(client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        mock_transport = MagicMock()
+        mock_transport.auth_password.side_effect = Exception("Connection failed")
+        mock_transport.is_active.return_value = True
+
+        with patch.object(client, '_probe_host', return_value=mock_probe), \
+             patch.object(client, '_get_or_create_transport', return_value=mock_transport):
             with patch('sys.stdout', new_callable=StringIO):
                 results = client.scan(
                     ["192.168.1.1"],
@@ -1305,16 +1383,29 @@ class TestIntegration(unittest.TestCase):
         ports_tried = {r.port for r in results}
         self.assertEqual(ports_tried, {22, 2222, 22222})
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_scan_with_try_empty(self, mock_ssh_class):
+    def test_scan_with_try_empty(self):
         """Test scan with --try-empty adds empty password attempts."""
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = Exception("Connection failed")
-
         client = SSHAuditClient(try_empty=True)
 
-        with patch.object(client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        mock_transport = MagicMock()
+        mock_transport.auth_password.side_effect = Exception("Connection failed")
+        mock_transport.is_active.return_value = True
+
+        with patch.object(client, '_probe_host', return_value=mock_probe), \
+             patch.object(client, '_get_or_create_transport', return_value=mock_transport):
             with patch('sys.stdout', new_callable=StringIO):
                 results = client.scan(
                     ["192.168.1.1"],
@@ -1329,16 +1420,29 @@ class TestIntegration(unittest.TestCase):
         self.assertIn("", passwords_tried)
         self.assertIn("password", passwords_tried)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_scan_with_user_as_pass(self, mock_ssh_class):
+    def test_scan_with_user_as_pass(self):
         """Test scan with --user-as-pass adds username as password."""
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = Exception("Connection failed")
-
         client = SSHAuditClient(user_as_pass=True)
 
-        with patch.object(client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        mock_transport = MagicMock()
+        mock_transport.auth_password.side_effect = Exception("Connection failed")
+        mock_transport.is_active.return_value = True
+
+        with patch.object(client, '_probe_host', return_value=mock_probe), \
+             patch.object(client, '_get_or_create_transport', return_value=mock_transport):
             with patch('sys.stdout', new_callable=StringIO):
                 results = client.scan(
                     ["192.168.1.1"],
@@ -1353,16 +1457,29 @@ class TestIntegration(unittest.TestCase):
         self.assertIn("admin", passwords_tried)
         self.assertIn("password", passwords_tried)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_scan_only_try_empty_no_passwords(self, mock_ssh_class):
+    def test_scan_only_try_empty_no_passwords(self):
         """Test scan with only --try-empty and no explicit passwords."""
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = Exception("Connection failed")
-
         client = SSHAuditClient(try_empty=True)
 
-        with patch.object(client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        mock_transport = MagicMock()
+        mock_transport.auth_password.side_effect = Exception("Connection failed")
+        mock_transport.is_active.return_value = True
+
+        with patch.object(client, '_probe_host', return_value=mock_probe), \
+             patch.object(client, '_get_or_create_transport', return_value=mock_transport):
             with patch('sys.stdout', new_callable=StringIO):
                 results = client.scan(
                     ["192.168.1.1"],
@@ -1374,17 +1491,30 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].password, "")
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_scan_with_checkpoint(self, mock_ssh_class):
+    def test_scan_with_checkpoint(self):
         """Test scan with checkpoint saving."""
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = Exception("Connection failed")
-
         checkpoint_file = os.path.join(self.temp_dir, "scan.checkpoint")
         client = SSHAuditClient(checkpoint_file=checkpoint_file)
 
-        with patch.object(client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        mock_transport = MagicMock()
+        mock_transport.auth_password.side_effect = Exception("Connection failed")
+        mock_transport.is_active.return_value = True
+
+        with patch.object(client, '_probe_host', return_value=mock_probe), \
+             patch.object(client, '_get_or_create_transport', return_value=mock_transport):
             with patch('sys.stdout', new_callable=StringIO):
                 results = client.scan(
                     ["192.168.1.1"],
@@ -1452,16 +1582,29 @@ class TestEdgeCases(unittest.TestCase):
 class TestSprayMode(unittest.TestCase):
     """Test cases for credential spray mode."""
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_spray_mode_order(self, mock_ssh_class):
+    def test_spray_mode_order(self):
         """Test that spray mode tries one password across all users/hosts first."""
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = Exception("Connection failed")
-
         client = SSHAuditClient(spray_mode=True)
 
-        with patch.object(client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        mock_transport = MagicMock()
+        mock_transport.auth_password.side_effect = Exception("Connection failed")
+        mock_transport.is_active.return_value = True
+
+        with patch.object(client, '_probe_host', return_value=mock_probe), \
+             patch.object(client, '_get_or_create_transport', return_value=mock_transport):
             with patch('sys.stdout', new_callable=StringIO):
                 results = client.scan(
                     ["192.168.1.1", "192.168.1.2"],
@@ -1481,22 +1624,34 @@ class TestSprayMode(unittest.TestCase):
         # All attempts in a round should have the same password
         self.assertEqual(len(set(first_four_passwords)), 1)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_spray_mode_disabled_by_default(self, mock_ssh_class):
+    def test_spray_mode_disabled_by_default(self):
         """Test that spray mode is disabled by default."""
         client = SSHAuditClient()
         self.assertFalse(client.spray_mode)
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_spray_vs_normal_mode_same_count(self, mock_ssh_class):
+    def test_spray_vs_normal_mode_same_count(self):
         """Test that spray and normal mode produce same number of attempts."""
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = Exception("Failed")
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        mock_transport = MagicMock()
+        mock_transport.auth_password.side_effect = Exception("Failed")
+        mock_transport.is_active.return_value = True
 
         # Normal mode
         normal_client = SSHAuditClient()
-        with patch.object(normal_client, '_get_ssh_banner', return_value=""):
+        with patch.object(normal_client, '_probe_host', return_value=mock_probe), \
+             patch.object(normal_client, '_get_or_create_transport', return_value=mock_transport):
             with patch('sys.stdout', new_callable=StringIO):
                 normal_results = normal_client.scan(
                     ["192.168.1.1"], ["root", "admin"], ["pass1", "pass2"], [22]
@@ -1504,7 +1659,8 @@ class TestSprayMode(unittest.TestCase):
 
         # Spray mode
         spray_client = SSHAuditClient(spray_mode=True)
-        with patch.object(spray_client, '_get_ssh_banner', return_value=""):
+        with patch.object(spray_client, '_probe_host', return_value=mock_probe), \
+             patch.object(spray_client, '_get_or_create_transport', return_value=mock_transport):
             with patch('sys.stdout', new_callable=StringIO):
                 spray_results = spray_client.scan(
                     ["192.168.1.1"], ["root", "admin"], ["pass1", "pass2"], [22]
@@ -1563,16 +1719,29 @@ class TestTargetExclusion(unittest.TestCase):
         client = SSHAuditClient()
         self.assertFalse(client._is_excluded("192.168.1.1"))
 
-    @patch('sshcheck.paramiko.SSHClient')
-    def test_excluded_hosts_not_scanned(self, mock_ssh_class):
+    def test_excluded_hosts_not_scanned(self):
         """Test that excluded hosts are actually skipped during scan."""
-        mock_client = MagicMock()
-        mock_ssh_class.return_value = mock_client
-        mock_client.connect.side_effect = Exception("Failed")
-
         client = SSHAuditClient(exclude_hosts=["192.168.1.2"])
 
-        with patch.object(client, '_get_ssh_banner', return_value=""):
+        mock_probe = MagicMock()
+        mock_probe.banner = ""
+        mock_probe.os_info = ""
+        mock_probe.os_family = ""
+        mock_probe.ssh_version = ""
+        mock_probe.fingerprint_info = None
+        mock_probe.vulnerabilities = None
+        mock_probe.host_key_type = ""
+        mock_probe.host_key_fingerprint = ""
+        mock_probe.host_key_bits = 0
+        mock_probe.algorithms = {}
+        mock_probe.weak_algorithms = {}
+
+        mock_transport = MagicMock()
+        mock_transport.auth_password.side_effect = Exception("Failed")
+        mock_transport.is_active.return_value = True
+
+        with patch.object(client, '_probe_host', return_value=mock_probe), \
+             patch.object(client, '_get_or_create_transport', return_value=mock_transport):
             with patch('sys.stdout', new_callable=StringIO):
                 results = client.scan(
                     ["192.168.1.1", "192.168.1.2", "192.168.1.3"],

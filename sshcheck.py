@@ -26,6 +26,7 @@ import struct
 import sys
 import time
 import xml.etree.ElementTree as ET
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -113,6 +114,78 @@ def _version_in_range(version: str, low: tuple, high: tuple) -> bool:
     """Check if version is in range [low, high] inclusive."""
     v = _parse_version(version)
     return low <= v <= high
+
+
+def _build_version_checker(check_spec: dict):
+    """Convert a JSON version check specification dict into a callable.
+
+    Supported check_type values:
+      'range'          - version in [low, high] inclusive
+      'range_exclude'  - version in [low, high] AND NOT >= exclude_gte
+      'lt'             - version < target
+      'gte'            - version >= target
+      'always_false'   - never matches (placeholder / unknown entries)
+    """
+    t = check_spec.get("type", "always_false")
+    if t == "range":
+        low = tuple(check_spec["low"])
+        high = tuple(check_spec["high"])
+        return lambda v: _version_in_range(v, low, high)
+    elif t == "range_exclude":
+        low = tuple(check_spec["low"])
+        high = tuple(check_spec["high"])
+        excl = tuple(check_spec["exclude_gte"])
+        return lambda v: _version_in_range(v, low, high) and not _version_gte(v, excl)
+    elif t == "lt":
+        target = tuple(check_spec["target"])
+        return lambda v: _version_lt(v, target)
+    elif t == "gte":
+        target = tuple(check_spec["target"])
+        return lambda v: _version_gte(v, target)
+    return lambda v: False
+
+
+def load_cve_database(path: str) -> Optional[dict]:
+    """Load CVE database from an external JSON file.
+
+    The JSON file maps software names to lists of CVE entry dicts.  Each entry
+    uses a serialisable 'version_check' dict instead of a lambda; this function
+    reconstructs the callable via _build_version_checker() so the result has
+    the same structure as SSH_VULNERABILITIES.
+
+    Returns:
+        dict matching SSH_VULNERABILITIES structure, or None on any failure
+        (file not found, JSON parse error, etc.).
+    """
+    from pathlib import Path as _Path
+    import json as _json
+    p = _Path(path)
+    if not p.exists():
+        return None
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            raw = _json.load(f)
+    except (ValueError, IOError):
+        return None
+    result: dict = {}
+    for software, entries in raw.items():
+        # Skip metadata/comment keys — only process list-valued entries
+        if not isinstance(entries, list):
+            continue
+        result[software] = [
+            {
+                "cve": e.get("cve", ""),
+                "name": e.get("name", ""),
+                "severity": e.get("severity", "MEDIUM"),
+                "affected": e.get("affected", ""),
+                "description": e.get("description", ""),
+                "check": _build_version_checker(
+                    e.get("version_check", {"type": "always_false"})
+                ),
+            }
+            for e in entries
+        ]
+    return result
 
 
 # Detailed CVE vulnerability database with version-specific checks
@@ -229,6 +302,7 @@ SSH_VULNERABILITIES = {
     ],
 }
 
+# Values are dicts (algo → reason) so membership checks via `in` are O(1).
 WEAK_ALGORITHMS = {
     "kex": {
         "diffie-hellman-group1-sha1": "Weak 1024-bit DH group",
@@ -375,6 +449,31 @@ class VulnerabilityInfo:
 
 
 @dataclass
+class HostProbeResult:
+    """Cached result of a pre-authentication SSH host probe.
+
+    Populated once per (host, port) before credential attempts so that banner
+    parsing, host-key extraction, and algorithm enumeration are done only once
+    instead of on every _try_login() call.
+    """
+    host: str
+    port: int
+    banner: str = ""
+    os_info: str = ""
+    os_family: str = ""
+    ssh_version: str = ""
+    fingerprint_info: Optional['FingerprintInfo'] = None
+    vulnerabilities: Optional[List['VulnerabilityInfo']] = None
+    host_key_type: str = ""
+    host_key_fingerprint: str = ""
+    host_key_bits: int = 0
+    algorithms: Optional[Dict[str, List[str]]] = None
+    weak_algorithms: Optional[Dict[str, List[str]]] = None
+    probe_error: str = ""
+    probe_time: float = 0.0
+
+
+@dataclass
 class ScanResult:
     """Data class to store scan results for a single attempt."""
     host: str
@@ -408,6 +507,8 @@ class ScanResult:
     password_strength_label: str = ""
     fingerprint_info: Optional[FingerprintInfo] = None
     vulnerabilities: Optional[List[VulnerabilityInfo]] = None
+    agent_forwarding_allowed: bool = False
+    agent_forwarding_detected: bool = False
 
     def to_dict(self) -> dict:
         """Convert result to dictionary."""
@@ -562,6 +663,20 @@ class ProgressBar:
 
 
 # ============================================================================
+# IPv6 / Socket helpers
+# ============================================================================
+
+def _get_socket_family(host: str) -> socket.AddressFamily:
+    """Return AF_INET6 for IPv6 addresses, AF_INET otherwise."""
+    try:
+        if isinstance(ipaddress.ip_address(host), ipaddress.IPv6Address):
+            return socket.AF_INET6
+    except ValueError:
+        pass
+    return socket.AF_INET
+
+
+# ============================================================================
 # Main SSH Audit Client
 # ============================================================================
 
@@ -593,6 +708,9 @@ class SSHAuditClient:
         diff_mode: bool = False,
         color: bool = True,
         proxy: Optional[str] = None,
+        checkpoint_interval: int = 50,
+        cve_db_path: Optional[str] = None,
+        detect_agent_forwarding: bool = False,
     ):
         self.timeout = timeout
         self.verbose = verbose
@@ -639,19 +757,39 @@ class SSHAuditClient:
         if self.exclude_hosts:
             self._build_exclusion_set()
 
-        # Track per-host/user failure counts for lockout protection
-        self._failure_counts: Dict[str, int] = {}
-        # Track hosts with successful logins for stop-on-success
-        self._successful_hosts: Set[str] = set()
-        # Known host keys for MITM detection
-        self._known_host_keys: Dict[str, Tuple[str, str]] = {}  # host:port -> (type, fingerprint)
-        # Load known hosts if provided
-        if self.known_hosts_file:
-            self._load_known_hosts()
-        # Excluded host set (expanded from CIDRs, ranges, etc.)
-        self._excluded_set: Set[str] = set()
-        if self.exclude_hosts:
-            self._build_exclusion_set()
+        # ---- New feature attributes ----
+
+        # Configurable checkpoint save frequency (Step 8 / Change 8)
+        self.checkpoint_interval = checkpoint_interval
+
+        # SSH agent forwarding detection (Step 8 / Change 7)
+        self.detect_agent_forwarding = detect_agent_forwarding
+
+        # Host probe cache: one pre-auth probe per (host, port) (Change 4)
+        self._host_probe_cache: Dict[str, 'HostProbeResult'] = {}
+        self._host_probe_cache_lock = threading.Lock()
+
+        # Transport reuse cache: active paramiko.Transport per (host, port) (Change 2)
+        self._transport_cache: Dict[str, paramiko.Transport] = {}
+        self._transport_host_locks: Dict[str, threading.Lock] = {}
+        self._transport_cache_lock = threading.Lock()
+
+        # CVE database: load from external JSON or fall back to built-in (Change 5)
+        self.cve_db_path = cve_db_path
+        self._cve_database: Optional[dict] = None
+        if cve_db_path:
+            self._cve_database = load_cve_database(cve_db_path)
+        if self._cve_database is None:
+            for _dp in [
+                Path(__file__).parent / "cve_database.json",
+                Path.home() / ".config" / "sshcheck" / "cve_database.json",
+            ]:
+                _loaded = load_cve_database(str(_dp))
+                if _loaded is not None:
+                    self._cve_database = _loaded
+                    break
+        if self._cve_database is None:
+            self._cve_database = SSH_VULNERABILITIES
 
         # Suppress paramiko logging unless verbose
         if not verbose:
@@ -723,7 +861,7 @@ class SSHAuditClient:
             return sock
 
         elif self._proxy_type == "http":
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock = socket.socket(_get_socket_family(self._proxy_host or dest_host), socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
             sock.connect((self._proxy_host, self._proxy_port))
 
@@ -840,7 +978,7 @@ class SSHAuditClient:
         if not fingerprint.software or not fingerprint.software_version:
             return vulns
 
-        software_vulns = SSH_VULNERABILITIES.get(fingerprint.software, [])
+        software_vulns = self._cve_database.get(fingerprint.software, [])
 
         for vuln in software_vulns:
             try:
@@ -1019,6 +1157,62 @@ class SSHAuditClient:
 
         return (score, reasons)
 
+    def _detect_agent_forwarding(
+        self, transport: paramiko.Transport
+    ) -> Tuple[bool, bool]:
+        """Detect SSH agent forwarding configuration and runtime state.
+
+        Runs three lightweight checks on the remote host via the authenticated
+        transport:
+          1. ``sshd -T`` — reads AllowAgentForwarding from the daemon config.
+          2. ``echo $SSH_AUTH_SOCK`` — checks for an active agent socket variable.
+          3. ``find /tmp`` — looks for agent socket files created by ssh-agent.
+
+        Args:
+            transport: An authenticated (post-auth) paramiko.Transport.
+
+        Returns:
+            Tuple of (agent_forwarding_allowed: bool, agent_forwarding_detected: bool)
+        """
+        allowed = False
+        detected = False
+
+        def _exec(cmd: str) -> str:
+            try:
+                chan = transport.open_session()
+                chan.exec_command(cmd)
+                chan.settimeout(self.timeout)
+                out = b""
+                while True:
+                    chunk = chan.recv(4096)
+                    if not chunk:
+                        break
+                    out += chunk
+                chan.close()
+                return out.decode('utf-8', errors='replace').strip()
+            except Exception:
+                return ""
+
+        # Check 1: sshd daemon configuration
+        sshd_out = _exec("sshd -T 2>/dev/null | grep -i allowagentforwarding")
+        if 'allowagentforwarding yes' in sshd_out.lower():
+            allowed = True
+
+        # Check 2: SSH_AUTH_SOCK environment variable
+        auth_sock = _exec("echo $SSH_AUTH_SOCK")
+        if auth_sock:
+            detected = True
+
+        # Check 3: agent socket files in /tmp
+        if not detected:
+            find_out = _exec(
+                "find /tmp -name 'agent.*' -path '*/ssh-*' 2>/dev/null | head -5"
+            )
+            if find_out:
+                detected = True
+
+        return (allowed, detected)
+
     @staticmethod
     def score_password_strength(password: str, username: str = "") -> Tuple[float, str]:
         """
@@ -1168,7 +1362,7 @@ class SSHAuditClient:
 
         for port in ports:
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock = socket.socket(_get_socket_family(host), socket.SOCK_STREAM)
                 sock.settimeout(timeout)
                 if source_ip:
                     sock.bind((source_ip, 0))
@@ -1419,6 +1613,13 @@ class SSHAuditClient:
             if not target or target.startswith('#'):
                 continue
 
+            # Strip IPv6 bracket notation: [::1] or [2001:db8::1]
+            if target.startswith('['):
+                bracket_end = target.find(']')
+                if bracket_end != -1:
+                    yield target[1:bracket_end]
+                    continue
+
             try:
                 # Try parsing as a network (CIDR notation)
                 if '/' in target:
@@ -1503,7 +1704,7 @@ class SSHAuditClient:
             if self._proxy_type:
                 sock = self._create_proxy_socket(host, port)
             else:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock = socket.socket(_get_socket_family(host), socket.SOCK_STREAM)
                 sock.settimeout(self.timeout)
                 if self.source_ip:
                     sock.bind((self.source_ip, 0))
@@ -1620,6 +1821,178 @@ class SSHAuditClient:
 
         return weak
 
+    # ------------------------------------------------------------------
+    # Host probe cache — unauthenticated pre-scan per host:port (Change 4)
+    # ------------------------------------------------------------------
+
+    def _probe_host(self, host: str, port: int) -> 'HostProbeResult':
+        """Perform an unauthenticated probe of an SSH host to collect metadata.
+
+        Uses a paramiko Transport at key-exchange level (no authentication) to
+        collect: banner, host key, negotiated algorithms, OS fingerprint, and
+        CVE vulnerabilities.  The result is cached in _host_probe_cache so that
+        subsequent _try_login() calls for the same host:port skip this work.
+
+        Falls back to the legacy _get_ssh_banner() path on Transport failure.
+
+        Thread safety: _host_probe_cache_lock guards both the read and write
+        operations on the cache dict.
+        """
+        cache_key = f"{host}:{port}"
+
+        # Fast path: already cached
+        with self._host_probe_cache_lock:
+            if cache_key in self._host_probe_cache:
+                return self._host_probe_cache[cache_key]
+
+        probe = HostProbeResult(host=host, port=port)
+        start_time = time.time()
+        transport = None
+
+        try:
+            # Build the socket (respecting proxy / source_ip / IPv6)
+            if self._proxy_type:
+                sock = self._create_proxy_socket(host, port)
+            else:
+                sock = socket.socket(_get_socket_family(host), socket.SOCK_STREAM)
+                sock.settimeout(self.timeout)
+                if self.source_ip:
+                    sock.bind((self.source_ip, 0))
+                sock.connect((host, port))
+
+            transport = paramiko.Transport(sock)
+            transport.start_client(timeout=self.timeout)
+
+            # Host key
+            key = transport.get_remote_server_key()
+            if key:
+                key_bytes = key.asbytes()
+                fp_hex = hashlib.sha256(key_bytes).hexdigest()
+                fp_fmt = ':'.join(fp_hex[i:i + 2] for i in range(0, len(fp_hex), 2))
+                probe.host_key_type = key.get_name()
+                probe.host_key_fingerprint = f"SHA256:{fp_fmt}"
+                try:
+                    probe.host_key_bits = key.get_bits()
+                except Exception:
+                    probe.host_key_bits = 0
+
+            # Algorithms
+            probe.algorithms = self._get_algorithms(transport)
+            probe.weak_algorithms = self._find_weak_algorithms(probe.algorithms)
+
+            # Banner: paramiko sets remote_version after start_client()
+            probe.banner = getattr(transport, 'remote_version', '') or ''
+            # Normalise: some paramiko versions already strip the CRLF
+            probe.banner = probe.banner.strip()
+
+            # OS fingerprint and CVE checks
+            probe.os_info, probe.os_family, probe.ssh_version = \
+                self._fingerprint_os(probe.banner)
+            probe.fingerprint_info = self._fingerprint_banner(probe.banner)
+            if probe.fingerprint_info:
+                probe.vulnerabilities = self._check_vulnerabilities(probe.fingerprint_info)
+
+        except Exception as exc:
+            probe.probe_error = str(exc)
+            # Fallback: grab at least the banner via raw socket read
+            if not probe.banner:
+                probe.banner = self._get_ssh_banner(host, port)
+                if probe.banner:
+                    probe.os_info, probe.os_family, probe.ssh_version = \
+                        self._fingerprint_os(probe.banner)
+                    probe.fingerprint_info = self._fingerprint_banner(probe.banner)
+                    if probe.fingerprint_info:
+                        probe.vulnerabilities = self._check_vulnerabilities(
+                            probe.fingerprint_info
+                        )
+        finally:
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+
+        probe.probe_time = time.time() - start_time
+
+        # Cache atomically; first writer wins (another thread may have raced)
+        with self._host_probe_cache_lock:
+            if cache_key not in self._host_probe_cache:
+                self._host_probe_cache[cache_key] = probe
+
+        return self._host_probe_cache[cache_key]
+
+    # ------------------------------------------------------------------
+    # Transport reuse cache — persistent SSH handshake per host:port (Change 2)
+    # ------------------------------------------------------------------
+
+    def _get_or_create_transport(
+        self, host: str, port: int
+    ) -> Optional[paramiko.Transport]:
+        """Return an active paramiko.Transport for host:port, creating one if needed.
+
+        Uses double-checked locking:
+          1. Quick check under _transport_cache_lock (read).
+          2. Acquire per-host lock to serialise transport creation.
+          3. Re-check cache before creating to avoid duplicate connections.
+
+        Returns None if the transport cannot be established.
+        """
+        cache_key = f"{host}:{port}"
+
+        # Quick read under coarse lock
+        with self._transport_cache_lock:
+            existing = self._transport_cache.get(cache_key)
+            if existing and existing.is_active():
+                return existing
+            # Ensure per-host lock exists
+            if cache_key not in self._transport_host_locks:
+                self._transport_host_locks[cache_key] = threading.Lock()
+            host_lock = self._transport_host_locks[cache_key]
+
+        # Serialise creation for this specific host:port
+        with host_lock:
+            # Re-check inside the per-host lock
+            with self._transport_cache_lock:
+                existing = self._transport_cache.get(cache_key)
+                if existing and existing.is_active():
+                    return existing
+
+            # Create a fresh transport
+            try:
+                if self._proxy_type:
+                    sock = self._create_proxy_socket(host, port)
+                else:
+                    sock = socket.socket(_get_socket_family(host), socket.SOCK_STREAM)
+                    sock.settimeout(self.timeout)
+                    if self.source_ip:
+                        sock.bind((self.source_ip, 0))
+                    sock.connect((host, port))
+
+                transport = paramiko.Transport(sock)
+                transport.start_client(timeout=self.timeout)
+
+                with self._transport_cache_lock:
+                    self._transport_cache[cache_key] = transport
+
+                return transport
+
+            except Exception as exc:
+                if self.verbose:
+                    self.logger.debug(
+                        f"Failed to create transport for {cache_key}: {exc}"
+                    )
+                return None
+
+    def _close_transport_cache(self) -> None:
+        """Close all cached transports. Called once at the end of scan()."""
+        with self._transport_cache_lock:
+            for transport in self._transport_cache.values():
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+            self._transport_cache.clear()
+
     def _assess_severity(self, result: ScanResult) -> Tuple[str, List[str]]:
         """
         Assess severity of a finding based on multiple factors.
@@ -1687,6 +2060,16 @@ class SSHAuditClient:
                 f"Previous: {result.host_key_previous}"
             )
 
+        # Check for SSH agent forwarding (post-auth check, Change 7)
+        if result.agent_forwarding_detected:
+            severity = max(severity, SeverityLevel.HIGH, key=lambda s: _severity_rank(s))
+            reasons.append(
+                "SSH agent forwarding socket active — lateral movement risk"
+            )
+        elif result.agent_forwarding_allowed:
+            severity = max(severity, SeverityLevel.MEDIUM, key=lambda s: _severity_rank(s))
+            reasons.append("SSH agent forwarding enabled in sshd configuration")
+
         if not reasons:
             reasons.append("No significant findings")
 
@@ -1727,114 +2110,104 @@ class SSHAuditClient:
             key_file=key_file or ""
         )
 
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
         try:
-            # Get banner before full connection
-            result.banner = self._get_ssh_banner(host, port)
+            # --- Populate from host probe cache (one probe per host:port) ---
+            # _probe_host() is called before credentials are dispatched in scan(),
+            # so this is usually a fast cache hit.
+            probe = self._probe_host(host, port)
+            result.banner = probe.banner
+            result.os_info = probe.os_info
+            result.os_family = probe.os_family
+            result.ssh_version = probe.ssh_version
+            result.fingerprint_info = probe.fingerprint_info
+            result.vulnerabilities = probe.vulnerabilities
+            # Pre-populate key/algorithm info from probe; overwritten after auth
+            if probe.host_key_type:
+                result.host_key_type = probe.host_key_type
+                result.host_key_fingerprint = probe.host_key_fingerprint
+                result.host_key_bits = probe.host_key_bits
+            if probe.algorithms:
+                result.algorithms = probe.algorithms
+                result.weak_algorithms = probe.weak_algorithms
 
-            # Fingerprint OS from banner (simple method)
-            os_info, os_family, ssh_version = self._fingerprint_os(result.banner)
-            result.os_info = os_info
-            result.os_family = os_family
-            result.ssh_version = ssh_version
+            # --- Authenticate via transport cache (connection reuse) ---
+            transport = self._get_or_create_transport(host, port)
+            if transport is None:
+                raise paramiko.SSHException(
+                    f"Cannot establish SSH transport to {host}:{port}"
+                )
 
-            # Enhanced banner fingerprinting
-            result.fingerprint_info = self._fingerprint_banner(result.banner)
-
-            # CVE vulnerability checking
-            if result.fingerprint_info:
-                result.vulnerabilities = self._check_vulnerabilities(result.fingerprint_info)
-
-            # Build connection kwargs
-
-            connect_kwargs = dict(
-                hostname=host,
-                port=port,
-                username=username,
-                timeout=self.timeout,
-                allow_agent=False,
-                look_for_keys=False,
-                banner_timeout=self.timeout,
-            )
-            if self.source_ip:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(self.timeout)
-                sock.bind((self.source_ip, 0))
-                sock.connect((host, port))
-                connect_kwargs['sock'] = sock
-
-            client.connect(**connect_kwargs)
-
-            # Create proxy socket if needed
-            if self._proxy_type:
-                sock = self._create_proxy_socket(host, port)
-                connect_kwargs['sock'] = sock
-            elif self.source_ip:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(self.timeout)
-                sock.bind((self.source_ip, 0))
-                sock.connect((host, port))
-                connect_kwargs['sock'] = sock
-
-            # Key-based or password authentication
             if key_file:
                 pkey = self._load_private_key(key_file, password if password else None)
-                connect_kwargs['pkey'] = pkey
+                transport.auth_publickey(username, pkey)
             else:
-                connect_kwargs['password'] = password
-
-            client.connect(**connect_kwargs)
+                transport.auth_password(username, password)
 
             result.connection_time = time.time() - start_time
             result.success = True
 
-            # Collect host key and algorithm info from transport
-            transport = client.get_transport()
-            if transport:
-                key_type, fingerprint, key_bits = self._get_host_key_info(transport)
+            # Refresh host key + algorithm data from authenticated transport
+            # (more accurate than the pre-auth probe values)
+            key_type, fingerprint, key_bits = self._get_host_key_info(transport)
+            if key_type:
                 result.host_key_type = key_type
                 result.host_key_fingerprint = fingerprint
                 result.host_key_bits = key_bits
-
-                algorithms = self._get_algorithms(transport)
+            algorithms = self._get_algorithms(transport)
+            if algorithms:
                 result.algorithms = algorithms
                 result.weak_algorithms = self._find_weak_algorithms(algorithms)
 
-            # Execute command if specified
+            # --- Execute command or capture initial shell output ---
             if self.command:
                 try:
-                    stdin, stdout, stderr = client.exec_command(
-                        self.command, timeout=self.timeout
-                    )
-                    result.command_output = stdout.read().decode(
-                        'utf-8', errors='replace'
-                    )
-                    err_output = stderr.read().decode('utf-8', errors='replace')
-                    if err_output:
-                        result.command_output += f"\n[stderr]: {err_output}"
+                    chan = transport.open_session()
+                    chan.settimeout(self.timeout)
+                    chan.exec_command(self.command)
+                    out_buf = b""
+                    while True:
+                        chunk = chan.recv(4096)
+                        if not chunk:
+                            break
+                        out_buf += chunk
+                    result.command_output = out_buf.decode('utf-8', errors='replace')
+                    err_buf = b""
+                    if chan.recv_stderr_ready():
+                        while True:
+                            chunk = chan.recv_stderr(4096)
+                            if not chunk:
+                                break
+                            err_buf += chunk
+                    if err_buf:
+                        result.command_output += (
+                            "\n[stderr]: " + err_buf.decode('utf-8', errors='replace')
+                        )
+                    chan.close()
                 except Exception as e:
                     result.command_output = f"[exec error]: {e}"
-
-            # Try to get initial shell output (only if no command was run)
-            if not self.command:
+            else:
+                # Capture initial shell output (MOTD etc.)
                 try:
-                    channel = client.invoke_shell()
-                    channel.settimeout(3)  # Short timeout for initial output
-                    time.sleep(1)  # Wait for initial output
-
+                    chan = transport.open_session()
+                    chan.get_pty()
+                    chan.invoke_shell()
+                    chan.settimeout(3)
+                    time.sleep(1)
                     output_buffer = b""
-                    while channel.recv_ready():
-                        output_buffer += channel.recv(4096)
+                    while chan.recv_ready():
+                        output_buffer += chan.recv(4096)
                         time.sleep(0.1)
-
                     result.initial_output = output_buffer.decode('utf-8', errors='replace')
-                    channel.close()
+                    chan.close()
                 except Exception as e:
-                    # Even if we can't get shell output, login was successful
                     if self.verbose:
                         self.logger.debug(f"Could not get shell output: {e}")
+
+            # --- Agent forwarding detection (post-auth, optional) ---
+            if self.detect_agent_forwarding:
+                af_allowed, af_detected = self._detect_agent_forwarding(transport)
+                result.agent_forwarding_allowed = af_allowed
+                result.agent_forwarding_detected = af_detected
 
             self.stats.successful_logins += 1
             self._successful_hosts.add(f"{host}:{port}")
@@ -1844,6 +2217,11 @@ class SSHAuditClient:
             self.stats.authentication_errors += 1
             self.stats.failed_logins += 1
 
+            # Evict stale transport from cache (server likely closed the connection)
+            cache_key = f"{host}:{port}"
+            with self._transport_cache_lock:
+                self._transport_cache.pop(cache_key, None)
+
             # Track failures for lockout protection
             key = f"{host}:{port}:{username}"
             self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
@@ -1852,6 +2230,10 @@ class SSHAuditClient:
             result.error_message = f"SSH error: {str(e)}"
             self.stats.connection_errors += 1
             self.stats.failed_logins += 1
+            # Evict potentially broken transport
+            cache_key = f"{host}:{port}"
+            with self._transport_cache_lock:
+                self._transport_cache.pop(cache_key, None)
 
         except socket.timeout:
             result.error_message = (
@@ -1878,12 +2260,6 @@ class SSHAuditClient:
             result.error_message = f"Unexpected error: {type(e).__name__}: {str(e)}"
             self.stats.connection_errors += 1
             self.stats.failed_logins += 1
-
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
 
         result.connection_time = time.time() - start_time
         self.stats.total_attempts += 1
@@ -2165,6 +2541,39 @@ class SSHAuditClient:
                     for username, password in combo_list:
                         work_items.append((host, port, username, password, None))
 
+        # Sort work items by (host, port) so all credentials for the same host
+        # are adjacent — maximises transport cache reuse (Change 3).
+        # Skip re-sorting in spray mode since that mode intentionally interleaves
+        # hosts in a round-robin-per-password pattern.
+        if not self.spray_mode:
+            work_items.sort(key=lambda item: (item[0], item[1]))
+
+        # Pre-probe all unique host:port pairs before dispatching credentials.
+        # This populates _host_probe_cache so _try_login() skips redundant
+        # unauthenticated connections (Change 4).
+        unique_host_ports = list({(h, p) for h, p, _, _, _ in work_items})
+        if not self.quiet and unique_host_ports:
+            print(
+                f"Probing {len(unique_host_ports)} host(s) for SSH metadata...",
+                flush=True
+            )
+        if self.threads > 1 and len(unique_host_ports) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(self.threads, len(unique_host_ports))
+            ) as probe_ex:
+                probe_futures = {
+                    probe_ex.submit(self._probe_host, h, p): (h, p)
+                    for h, p in unique_host_ports
+                }
+                for pf in as_completed(probe_futures):
+                    try:
+                        pf.result()
+                    except Exception:
+                        pass
+        else:
+            for h, p in unique_host_ports:
+                self._probe_host(h, p)
+
         total = len(work_items)
 
         # Load checkpoint if resuming
@@ -2280,7 +2689,7 @@ class SSHAuditClient:
                         if progress_bar:
                             progress_bar.update(current, f"{status} {result.host}:{result.port}")
                         self._print_progress(result, current, total)
-                        if self.checkpoint_file and current % 50 == 0:
+                        if self.checkpoint_file and current % self.checkpoint_interval == 0:
                             self._save_checkpoint(completed_items)
                     except Exception as e:
                         h, p, u, pw, kf = futures[future]
@@ -2313,7 +2722,7 @@ class SSHAuditClient:
                     progress_bar.update(current, f"{status} {result.host}:{result.port}")
                 self._print_progress(result, current, total)
 
-                if self.checkpoint_file and current % 50 == 0:
+                if self.checkpoint_file and current % self.checkpoint_interval == 0:
                     self._save_checkpoint(completed_items)
 
         if progress_bar:
@@ -2324,6 +2733,9 @@ class SSHAuditClient:
         # Final checkpoint save
         if self.checkpoint_file:
             self._save_checkpoint(completed_items)
+
+        # Close all cached SSH transports
+        self._close_transport_cache()
 
         # Print summary
         self._print_summary()
@@ -3587,6 +3999,26 @@ Report bugs to: https://github.com/rom/sshcheck/issues
             'and SSH version changes.'
         )
     )
+    security_group.add_argument(
+        '--detect-agent-forwarding',
+        action='store_true',
+        dest='detect_agent_forwarding',
+        help=(
+            'After successful login, check if SSH agent forwarding is enabled '
+            'or active on the remote host. Runs sshd -T, checks SSH_AUTH_SOCK, '
+            'and inspects /tmp for agent socket files.'
+        )
+    )
+    security_group.add_argument(
+        '--cve-db',
+        metavar='FILE',
+        dest='cve_db',
+        help=(
+            'Path to an external CVE database JSON file. '
+            'Defaults to cve_database.json in the script directory, '
+            'or ~/.config/sshcheck/cve_database.json.'
+        )
+    )
 
     # Nmap integration
     nmap_group = parser.add_argument_group('Nmap Integration')
@@ -3681,6 +4113,18 @@ Report bugs to: https://github.com/rom/sshcheck/issues
             'Helps avoid rate limiting and IDS detection. Default: 0 (no jitter).'
         )
     )
+    perf_group.add_argument(
+        '--checkpoint-interval',
+        type=int,
+        default=50,
+        metavar='N',
+        dest='checkpoint_interval',
+        help=(
+            'Save scan checkpoint every N completed attempts. '
+            'Lower values provide finer resume granularity at the cost of I/O. '
+            'Default: 50'
+        )
+    )
 
     # Proxy options
     proxy_group = parser.add_argument_group('Proxy Options')
@@ -3751,6 +4195,9 @@ def apply_config(args: argparse.Namespace, config: dict):
         'combo_file': ('combo_file', str, None),
         'proxy': ('proxy', str, None),
         'no_color': ('no_color', bool, False),
+        'checkpoint_interval': ('checkpoint_interval', int, 50),
+        'cve_db': ('cve_db', str, None),
+        'detect_agent_forwarding': ('detect_agent_forwarding', bool, False),
     }
 
     for config_key, (attr_name, expected_type, default) in mapping.items():
@@ -4096,6 +4543,9 @@ def main():
         diff_mode=diff_mode,
         color=use_color,
         proxy=args.proxy,
+        checkpoint_interval=args.checkpoint_interval,
+        cve_db_path=getattr(args, 'cve_db', None),
+        detect_agent_forwarding=args.detect_agent_forwarding,
     )
 
     try:
